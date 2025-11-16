@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import Dict, List
+from typing import Dict, List, Tuple, Optional
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api import AstrBotConfig, logger
@@ -30,11 +30,14 @@ class ContinuousMessagePlugin(Star):
     
     # 尝试导入 Image 组件类（用于类型检查）
     _ImageComponent = None
+    _image_component_import_failed = False
     try:
         from astrbot.api.message import Image as _ImageComponent
     except ImportError:
         # 如果导入失败，使用类名检查作为后备方案
-        pass
+        # 警告：这种方式依赖于类的内部实现细节，如果框架未来版本重命名了 Image 类，此代码将失效
+        _image_component_import_failed = True
+        logger.warning("[消息防抖动] 无法导入 Image 组件类，将使用类名检查作为后备方案（存在兼容性风险）")
     
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -85,6 +88,65 @@ class ContinuousMessagePlugin(Star):
                 return text
         return str(response)
     
+    def _parse_message(self, message_obj) -> Tuple[str, bool, List[str]]:
+        """
+        从消息对象中解析文本和图片信息。
+        
+        这是一个统一的辅助方法，用于避免在多个地方重复相同的解析逻辑。
+        
+        Args:
+            message_obj: 消息对象，包含 message 属性（消息组件列表）
+            
+        Returns:
+            Tuple[str, bool, List[str]]: 
+                - 文本内容（如果无法提取则返回空字符串）
+                - 是否包含图片
+                - 图片URL列表
+        """
+        text = ""
+        has_image = False
+        image_urls = []
+        
+        try:
+            for component in message_obj.message:
+                # 检查是否是文本组件（Plain 或 Text）
+                if hasattr(component, '__class__'):
+                    comp_class_name = component.__class__.__name__
+                    if comp_class_name == 'Plain' or comp_class_name == 'Text':
+                        # 提取原始文本
+                        if hasattr(component, 'text'):
+                            text += component.text
+                        elif hasattr(component, 'content'):
+                            text += component.content
+                        elif hasattr(component, 'data'):
+                            text += str(component.data)
+                
+                # 检查是否是图片组件
+                # 优先使用 isinstance 检查（更健壮）
+                if self._ImageComponent is not None:
+                    is_image = isinstance(component, self._ImageComponent)
+                else:
+                    # 后备方案：使用类名检查（存在兼容性风险）
+                    # 警告：如果框架未来版本重命名了 Image 类，此代码将失效
+                    is_image = (hasattr(component, '__class__') 
+                               and component.__class__.__name__ == 'Image')
+                
+                if is_image:
+                    has_image = True
+                    # 提取图片URL
+                    if hasattr(component, 'url'):
+                        image_urls.append(component.url)
+                    elif hasattr(component, 'file'):
+                        image_urls.append(component.file)
+        except (AttributeError, TypeError) as e:
+            # 捕获具体的异常类型，记录日志以便调试
+            logger.warning(f"[消息防抖动] 解析消息组件时出错: {e}")
+        except Exception as e:
+            # 捕获其他未知异常，记录日志
+            logger.warning(f"[消息防抖动] 解析消息组件时出现未知错误: {e}")
+        
+        return text, has_image, image_urls
+    
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=100)
     async def handle_private_msg(self, event: AstrMessageEvent):
         """
@@ -102,34 +164,7 @@ class ContinuousMessagePlugin(Star):
         
         # 从原始消息组件中提取完整文本（包含指令前缀）
         # 因为 event.message_str 可能已经去掉了前缀
-        raw_text = ""
-        has_image = False
-        try:
-            for component in event.message_obj.message:
-                # 检查是否是文本组件（Plain）
-                if hasattr(component, 'text') or hasattr(component, '__class__'):
-                    comp_class_name = component.__class__.__name__
-                    if comp_class_name == 'Plain' or comp_class_name == 'Text':
-                        # 提取原始文本
-                        if hasattr(component, 'text'):
-                            raw_text += component.text
-                        elif hasattr(component, 'content'):
-                            raw_text += component.content
-                        elif hasattr(component, 'data'):
-                            raw_text += str(component.data)
-                
-                # 检查是否是图片组件
-                if self._ImageComponent is not None:
-                    is_image = isinstance(component, self._ImageComponent)
-                else:
-                    # 后备方案：使用类名检查
-                    is_image = (hasattr(component, '__class__') 
-                               and component.__class__.__name__ == 'Image')
-                
-                if is_image:
-                    has_image = True
-        except Exception:
-            pass
+        raw_text, has_image, _ = self._parse_message(event.message_obj)
         
         # 如果无法从组件提取文本，使用 event.message_str 作为后备
         if not raw_text:
@@ -164,39 +199,11 @@ class ContinuousMessagePlugin(Star):
             """处理单条消息，返回 True 表示成功处理，False 表示跳过"""
             nonlocal buffer, image_urls
             
-            # 从原始消息组件中提取完整文本（包含指令前缀）
-            text = ""
-            has_image = False
-            try:
-                for component in ev.message_obj.message:
-                    # 检查是否是文本组件（Plain）
-                    if hasattr(component, '__class__'):
-                        comp_class_name = component.__class__.__name__
-                        if comp_class_name == 'Plain' or comp_class_name == 'Text':
-                            # 提取原始文本
-                            if hasattr(component, 'text'):
-                                text += component.text
-                            elif hasattr(component, 'content'):
-                                text += component.content
-                            elif hasattr(component, 'data'):
-                                text += str(component.data)
-                    
-                    # 检查是否是图片组件
-                    if self._ImageComponent is not None:
-                        is_image = isinstance(component, self._ImageComponent)
-                    else:
-                        # 后备方案：使用类名检查
-                        is_image = (hasattr(component, '__class__') 
-                                   and component.__class__.__name__ == 'Image')
-                    
-                    if is_image:
-                        has_image = True
-                        if hasattr(component, 'url'):
-                            image_urls.append(component.url)
-                        elif hasattr(component, 'file'):
-                            image_urls.append(component.file)
-            except Exception:
-                pass
+            # 使用统一的解析方法提取消息内容
+            text, has_image, parsed_image_urls = self._parse_message(ev.message_obj)
+            
+            # 将解析到的图片URL添加到总列表
+            image_urls.extend(parsed_image_urls)
             
             # 如果无法从组件提取文本，使用 ev.message_str 作为后备
             if not text:
@@ -242,21 +249,11 @@ class ContinuousMessagePlugin(Star):
         ):
             nonlocal buffer, image_urls
             
-            # 从原始消息组件中提取完整文本（包含指令前缀）
-            text = ""
-            try:
-                for component in ev.message_obj.message:
-                    if hasattr(component, '__class__'):
-                        comp_class_name = component.__class__.__name__
-                        if comp_class_name == 'Plain' or comp_class_name == 'Text':
-                            if hasattr(component, 'text'):
-                                text += component.text
-                            elif hasattr(component, 'content'):
-                                text += component.content
-                            elif hasattr(component, 'data'):
-                                text += str(component.data)
-            except Exception:
-                pass
+            # 使用统一的解析方法提取消息内容
+            text, has_image, parsed_image_urls = self._parse_message(ev.message_obj)
+            
+            # 将解析到的图片URL添加到总列表
+            image_urls.extend(parsed_image_urls)
             
             # 如果无法从组件提取文本，使用 ev.message_str 作为后备
             if not text:
@@ -264,8 +261,10 @@ class ContinuousMessagePlugin(Star):
             else:
                 text = text.strip()
             
-            # 检查是否是第一条消息的重复处理（避免 session_waiter 重复处理第一条消息）
-            # 如果 buffer 只有一条消息，且新消息内容与第一条相同，则跳过
+            # 防止 session_waiter 重复处理第一条消息
+            # 说明：session_waiter 可能会在第一次调用时再次处理初始事件
+            # 如果 buffer 中只有一条消息，且当前消息内容与第一条相同，则跳过
+            # 这样可以避免同一条消息被处理两次
             if len(buffer) == 1 and text == buffer[0]:
                 logger.info(f"[消息防抖动] 跳过重复处理的第一条消息: {text[:50]}")
                 # 重置超时时间，继续等待后续消息
@@ -311,6 +310,7 @@ class ContinuousMessagePlugin(Star):
                 system_prompt = None
             
             # 获取对话历史
+            context_history = []
             try:
                 conv_mgr = self.context.conversation_manager
                 curr_cid = await conv_mgr.get_curr_conversation_id(umo)
@@ -321,9 +321,15 @@ class ContinuousMessagePlugin(Star):
                 )
                 
                 if conversation and conversation.history:
-                    context_history = json.loads(conversation.history)
-                else:
-                    context_history = []
+                    try:
+                        context_history = json.loads(conversation.history)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"[消息防抖动] 对话历史格式错误，无法解析: {e}")
+                        context_history = []
+                    except TypeError as e:
+                        # conversation.history 可能为 None 或其他非字符串类型
+                        logger.warning(f"[消息防抖动] 对话历史类型错误: {e}")
+                        context_history = []
             except Exception as e:
                 logger.warning(f"[消息防抖动] 获取对话历史失败: {e}")
                 context_history = []
