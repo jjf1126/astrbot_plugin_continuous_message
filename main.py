@@ -147,6 +147,128 @@ class ContinuousMessagePlugin(Star):
         
         return text, has_image, image_urls
     
+    def _process_message(self, ev: AstrMessageEvent, buffer: List[str]) -> bool:
+        """处理单条消息，返回是否成功处理（不处理图片URL）"""
+        # 使用统一的解析方法提取消息内容
+        text, has_image, _ = self._parse_message(ev.message_obj)
+        
+        # 如果无法从组件提取文本，使用 ev.message_str 作为后备
+        if not text:
+            text = (ev.message_str or "").strip()
+        else:
+            text = text.strip()
+        
+        # 如果既没有文本也没有图片，跳过
+        if not text and not has_image:
+            return False
+        
+        # 如果有文本，检查是否是指令
+        if text and self.is_command(text):
+            return False
+        
+        # 显示处理日志（优先显示文本，如果没有文本则显示图片标识）
+        display_msg = text[:50] if text else "[图片]"
+        logger.info(f"[消息防抖动] 处理消息: {display_msg}")
+        
+        # 普通消息或图片：接管处理，阻止后续默认流程
+        ev.stop_event()
+        
+        # 如果有文本，加入缓冲区
+        if text:
+            buffer.append(text)
+        
+        # 如果只有图片没有文本，添加占位符
+        if has_image and not text:
+            buffer.append("[图片]")
+        
+        return True
+    
+    async def _send_to_llm(self, merged_msg: str, img_urls: List[str], unified_msg_origin: str):
+        """将合并的消息发送给 LLM 并返回响应"""
+        if not merged_msg:
+            return None
+        
+        # 获取 LLM 提供商
+        provider = self.context.get_using_provider(umo=unified_msg_origin)
+        if not provider:
+            logger.warning(f"[消息防抖动] 未找到 LLM 提供商")
+            return None
+        
+        # 获取人格设定
+        try:
+            persona = await self.context.persona_manager.get_default_persona_v3(umo=unified_msg_origin)
+            
+            if persona:
+                if isinstance(persona, dict):
+                    system_prompt = persona.get('prompt') or persona.get('system_prompt')
+                else:
+                    system_prompt = getattr(persona, 'prompt', None) or getattr(persona, 'system_prompt', None)
+            else:
+                system_prompt = None
+                
+        except Exception as e:
+            logger.error(f"[消息防抖动] 获取会话人格失败: {e}")
+            system_prompt = None
+        
+        # 获取对话历史
+        context_history = []
+        try:
+            conv_mgr = self.context.conversation_manager
+            curr_cid = await conv_mgr.get_curr_conversation_id(unified_msg_origin)
+            conversation = await conv_mgr.get_conversation(
+                unified_msg_origin,
+                curr_cid,
+                create_if_not_exists=True
+            )
+            
+            if conversation and conversation.history:
+                try:
+                    context_history = json.loads(conversation.history)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"[消息防抖动] 对话历史格式错误，无法解析: {e}")
+                    context_history = []
+                except TypeError as e:
+                    # conversation.history 可能为 None 或其他非字符串类型
+                    logger.warning(f"[消息防抖动] 对话历史类型错误: {e}")
+                    context_history = []
+        except Exception as e:
+            logger.warning(f"[消息防抖动] 获取对话历史失败: {e}")
+            context_history = []
+        
+        # 调用 LLM
+        try:
+            response = await provider.text_chat(
+                prompt=merged_msg,
+                context=context_history,
+                system_prompt=system_prompt,
+                image_urls=img_urls if img_urls else None
+            )
+            
+            # 获取响应文本
+            response_text = self._extract_response_text(response)
+            
+            if not response_text:
+                logger.error(f"[消息防抖动] LLM 响应为空")
+                return None
+            
+            # 更新对话历史
+            try:
+                context_history.append({"role": "user", "content": merged_msg})
+                context_history.append({"role": "assistant", "content": response_text})
+                await conv_mgr.update_conversation(
+                    unified_msg_origin,
+                    curr_cid,
+                    history=context_history
+                )
+            except Exception as e:
+                logger.warning(f"[消息防抖动] 更新对话历史失败: {e}")
+            
+            return response_text
+            
+        except Exception as e:
+            logger.error(f"[消息防抖动] LLM 请求失败: {e}", exc_info=True)
+            return None
+    
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=100)
     async def handle_private_msg(self, event: AstrMessageEvent):
         """
@@ -194,51 +316,22 @@ class ContinuousMessagePlugin(Star):
         # 存储图片 URL 列表
         image_urls = []
         
-        # 处理第一条消息的函数（提取逻辑）
-        def process_message(ev: AstrMessageEvent) -> bool:
-            """处理单条消息，返回 True 表示成功处理，False 表示跳过"""
-            nonlocal buffer, image_urls
-            
-            # 使用统一的解析方法提取消息内容
-            text, has_image, parsed_image_urls = self._parse_message(ev.message_obj)
-            
-            # 将解析到的图片URL添加到总列表
-            image_urls.extend(parsed_image_urls)
-            
-            # 如果无法从组件提取文本，使用 ev.message_str 作为后备
-            if not text:
-                text = (ev.message_str or "").strip()
-            else:
-                text = text.strip()
-            
-            # 如果既没有文本也没有图片，跳过
-            if not text and not has_image:
-                return False
-            
-            # 如果有文本，检查是否是指令
-            if text and self.is_command(text):
-                return False
-            
-            # 显示处理日志（优先显示文本，如果没有文本则显示图片标识）
-            display_msg = text[:50] if text else "[图片]"
-            logger.info(f"[消息防抖动] 处理消息: {display_msg}")
-            
-            # 普通消息或图片：接管处理，阻止后续默认流程
-            ev.stop_event()
-            
-            # 如果有文本，加入缓冲区
-            if text:
-                buffer.append(text)
-            
-            # 如果只有图片没有文本，添加占位符
-            if has_image and not text:
-                buffer.append("[图片]")
-            
-            return True
-        
         # 先处理第一条消息
-        if not process_message(event):
-            # 如果第一条消息处理失败（是指令或空消息），直接返回
+        raw_text, has_image, parsed_image_urls = self._parse_message(event.message_obj)
+        if not raw_text:
+            raw_text = (event.message_str or "").strip()
+        else:
+            raw_text = raw_text.strip()
+        
+        if not raw_text and not has_image:
+            return
+        
+        if raw_text and self.is_command(raw_text):
+            return
+        
+        image_urls.extend(parsed_image_urls)
+        success = self._process_message(event, buffer)
+        if not success:
             return
         
         # 会话控制器：收集后续消息 + 超时判断
@@ -251,9 +344,6 @@ class ContinuousMessagePlugin(Star):
             
             # 使用统一的解析方法提取消息内容
             text, has_image, parsed_image_urls = self._parse_message(ev.message_obj)
-            
-            # 将解析到的图片URL添加到总列表
-            image_urls.extend(parsed_image_urls)
             
             # 如果无法从组件提取文本，使用 ev.message_str 作为后备
             if not text:
@@ -271,102 +361,19 @@ class ContinuousMessagePlugin(Star):
                 controller.keep(timeout=self.debounce_time, reset_timeout=True)
                 return
             
-            # 处理后续消息
-            if not process_message(ev):
+            # 添加图片 URL
+            image_urls.extend(parsed_image_urls)
+            
+            # 处理消息
+            success = self._process_message(ev, buffer)
+            if success:
+                # 重置超时时间
+                controller.keep(timeout=self.debounce_time, reset_timeout=True)
+            else:
                 # 如果是指令，停止会话
                 if text and self.is_command(text):
                     controller.stop()
                 return
-            
-            # 重置超时时间
-            controller.keep(timeout=self.debounce_time, reset_timeout=True)
-        
-        # 提取 LLM 调用逻辑为独立函数，供超时和指令中断时复用
-        async def send_to_llm(merged_msg: str, img_urls: List[str], umo: str):
-            """将合并的消息发送给 LLM 并返回响应"""
-            if not merged_msg:
-                return None
-            
-            # 获取 LLM 提供商
-            provider = self.context.get_using_provider(umo=umo)
-            if not provider:
-                logger.warning(f"[消息防抖动] 未找到 LLM 提供商")
-                return None
-            
-            # 获取人格设定
-            try:
-                persona = await self.context.persona_manager.get_default_persona_v3(umo=umo)
-                
-                if persona:
-                    if isinstance(persona, dict):
-                        system_prompt = persona.get('prompt') or persona.get('system_prompt')
-                    else:
-                        system_prompt = getattr(persona, 'prompt', None) or getattr(persona, 'system_prompt', None)
-                else:
-                    system_prompt = None
-                    
-            except Exception as e:
-                logger.error(f"[消息防抖动] 获取会话人格失败: {e}")
-                system_prompt = None
-            
-            # 获取对话历史
-            context_history = []
-            try:
-                conv_mgr = self.context.conversation_manager
-                curr_cid = await conv_mgr.get_curr_conversation_id(umo)
-                conversation = await conv_mgr.get_conversation(
-                    umo,
-                    curr_cid,
-                    create_if_not_exists=True
-                )
-                
-                if conversation and conversation.history:
-                    try:
-                        context_history = json.loads(conversation.history)
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"[消息防抖动] 对话历史格式错误，无法解析: {e}")
-                        context_history = []
-                    except TypeError as e:
-                        # conversation.history 可能为 None 或其他非字符串类型
-                        logger.warning(f"[消息防抖动] 对话历史类型错误: {e}")
-                        context_history = []
-            except Exception as e:
-                logger.warning(f"[消息防抖动] 获取对话历史失败: {e}")
-                context_history = []
-            
-            # 调用 LLM
-            try:
-                response = await provider.text_chat(
-                    prompt=merged_msg,
-                    context=context_history,
-                    system_prompt=system_prompt,
-                    image_urls=img_urls if img_urls else None
-                )
-                
-                # 获取响应文本
-                response_text = self._extract_response_text(response)
-                
-                if not response_text:
-                    logger.error(f"[消息防抖动] LLM 响应为空")
-                    return None
-                
-                # 更新对话历史
-                try:
-                    context_history.append({"role": "user", "content": merged_msg})
-                    context_history.append({"role": "assistant", "content": response_text})
-                    await conv_mgr.update_conversation(
-                        umo,
-                        curr_cid,
-                        history=context_history
-                    )
-                except Exception as e:
-                    logger.warning(f"[消息防抖动] 更新对话历史失败: {e}")
-                
-                return response_text
-                
-            except Exception as e:
-                logger.error(f"[消息防抖动] LLM 请求失败: {e}", exc_info=True)
-                return None
         
         try:
             # 启动会话控制器，等待后续消息
@@ -379,8 +386,8 @@ class ContinuousMessagePlugin(Star):
                 merged_message = self.merge_separator.join(buffer).strip()
                 if merged_message:
                     logger.info(f"[消息防抖动] 指令中断，提交已收集的 {len(buffer)} 条消息给 LLM")
-                    umo = event.unified_msg_origin
-                    response_text = await send_to_llm(merged_message, image_urls, umo)
+                    unified_msg_origin = event.unified_msg_origin
+                    response_text = await self._send_to_llm(merged_message, image_urls, unified_msg_origin)
                     if response_text:
                         yield event.plain_result(response_text)
             
@@ -399,8 +406,8 @@ class ContinuousMessagePlugin(Star):
             event.stop_event()
             
             # 调用 LLM
-            umo = event.unified_msg_origin
-            response_text = await send_to_llm(merged_message, image_urls, umo)
+            unified_msg_origin = event.unified_msg_origin
+            response_text = await self._send_to_llm(merged_message, image_urls, unified_msg_origin)
             
             if response_text:
                 yield event.plain_result(response_text)
