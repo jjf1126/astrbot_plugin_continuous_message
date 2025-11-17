@@ -183,6 +183,24 @@ class ContinuousMessagePlugin(Star):
         
         return True
     
+    def _should_skip_message(self, event: AstrMessageEvent) -> Tuple[bool, str, bool, List[str]]:
+        """
+        检查消息是否应该跳过处理
+        
+        Returns:
+            Tuple[bool, str, bool, List[str]]: (是否跳过, 文本内容, 是否有图片, 图片URL列表)
+        """
+        raw_text, has_image, parsed_image_urls = self._parse_message(event.message_obj)
+        
+        if not raw_text:
+            raw_text = (event.message_str or "").strip()
+        else:
+            raw_text = raw_text.strip()
+        
+        skip = (not raw_text and not has_image) or (raw_text and self.is_command(raw_text))
+        
+        return skip, raw_text, has_image, parsed_image_urls
+    
     async def _send_to_llm(self, merged_msg: str, img_urls: List[str], unified_msg_origin: str):
         """将合并的消息发送给 LLM 并返回响应"""
         if not merged_msg:
@@ -284,22 +302,9 @@ class ContinuousMessagePlugin(Star):
         if not self.enable_plugin:
             return
         
-        # 从原始消息组件中提取完整文本（包含指令前缀）
-        # 因为 event.message_str 可能已经去掉了前缀
-        raw_text, has_image, _ = self._parse_message(event.message_obj)
-        
-        # 如果无法从组件提取文本，使用 event.message_str 作为后备
-        if not raw_text:
-            raw_text = (event.message_str or "").strip()
-        else:
-            raw_text = raw_text.strip()
-        
-        # 如果消息为空且没有图片，直接返回
-        if not raw_text and not has_image:
-            return
-        
-        # 检查是否是指令（使用原始文本，包含前缀）
-        if raw_text and self.is_command(raw_text):
+        # 检查消息是否应该跳过
+        skip, raw_text, has_image, parsed_image_urls = self._should_skip_message(event)
+        if skip:
             return
         
         # 显示开始防抖处理的日志（优先显示文本，如果没有文本则显示图片标识）
@@ -316,19 +321,7 @@ class ContinuousMessagePlugin(Star):
         # 存储图片 URL 列表
         image_urls = []
         
-        # 先处理第一条消息
-        raw_text, has_image, parsed_image_urls = self._parse_message(event.message_obj)
-        if not raw_text:
-            raw_text = (event.message_str or "").strip()
-        else:
-            raw_text = raw_text.strip()
-        
-        if not raw_text and not has_image:
-            return
-        
-        if raw_text and self.is_command(raw_text):
-            return
-        
+        # 处理第一条消息
         image_urls.extend(parsed_image_urls)
         success = self._process_message(event, buffer)
         if not success:
