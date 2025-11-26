@@ -133,6 +133,52 @@ class ContinuousMessagePlugin(Star):
         
         return text, has_image, image_urls
     
+    def _extract_text_from_content(self, content) -> str:
+        """
+        从消息内容中提取文本（用于对话历史处理）
+        
+        Args:
+            content: 消息内容，可能是字符串、列表或其他类型
+            
+        Returns:
+            str: 提取的文本内容
+        """
+        if isinstance(content, str):
+            return content
+        
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get('type') in ['text', 'plain']:
+                    text_parts.append(part.get('text', ''))
+            return ''.join(text_parts)
+        
+        return str(content) if content is not None else ''
+    
+    async def _get_caption_provider_id(self, unified_msg_origin: str) -> Optional[str]:
+        """
+        获取图片转述提供商 ID
+        
+        Args:
+            unified_msg_origin: 统一消息来源标识
+            
+        Returns:
+            Optional[str]: 图片转述提供商 ID，如果未配置则返回 None
+        """
+        try:
+            if hasattr(self.context, 'provider_manager'):
+                provider_settings = getattr(
+                    self.context.provider_manager, 
+                    'provider_settings', 
+                    {}
+                )
+                if isinstance(provider_settings, dict):
+                    return provider_settings.get('default_image_caption_provider_id')
+        except Exception as e:
+            logger.debug(f"[消息防抖动] 获取图片转述配置失败: {e}")
+        
+        return None
+    
     def _process_message(self, ev: AstrMessageEvent, buffer: List[str]) -> bool:
         """处理单条消息，返回是否成功处理（不处理图片URL）"""
         # 使用统一的解析方法提取消息内容
@@ -194,7 +240,14 @@ class ContinuousMessagePlugin(Star):
     
 
     async def _send_to_llm(self, merged_msg: str, img_urls: List[str], unified_msg_origin: str):
-        """将合并的消息发送给 LLM 并返回响应"""
+        """
+        将合并的消息发送给 LLM 并返回响应（v4.5.7+ 优化版本）
+        
+        优化点：
+        1. 直接使用 llm_generate 的 image_urls 参数，自动处理视觉支持
+        2. 简化人格设定获取逻辑
+        3. 优化对话历史处理
+        """
         if not merged_msg:
             return None
         
@@ -214,12 +267,10 @@ class ContinuousMessagePlugin(Star):
         try:
             persona = await self.context.persona_manager.get_default_persona_v3(umo=unified_msg_origin)
             if persona:
-                if isinstance(persona, dict):
-                    system_prompt = persona.get('prompt') or persona.get('system_prompt')
-                else:
-                    system_prompt = getattr(persona, 'prompt', None) or getattr(persona, 'system_prompt', None)
+                # v3 格式的人格对象有 prompt 属性
+                system_prompt = getattr(persona, 'prompt', None)
         except Exception as e:
-            logger.error(f"[消息防抖动] 获取会话人格失败: {e}")
+            logger.warning(f"[消息防抖动] 获取人格设定失败，将使用默认人格: {e}")
 
         # 获取并转换对话历史
         context_history_segments = []
@@ -239,67 +290,27 @@ class ContinuousMessagePlugin(Star):
                         role = msg.get('role')
                         content = msg.get('content')
                         
-                        # 处理 content 为列表的情况 (新版 AstrBot 历史记录格式)
-                        if isinstance(content, list):
-                            text_content = ""
-                            for part in content:
-                                if isinstance(part, dict):
-                                    # 提取 text 或 plain 类型的文本
-                                    if part.get('type') in ['text', 'plain']:
-                                        text_content += part.get('text', "")
-                                    # 也可以处理其他类型，如 image，但这里主要关注文本上下文
-                            content = text_content
-                        elif not isinstance(content, str):
-                            content = str(content) if content is not None else ""
+                        # 使用辅助方法提取文本内容
+                        text_content = self._extract_text_from_content(content)
 
                         if role == 'user':
-                            context_history_segments.append(UserMessageSegment(content=[TextPart(text=content)]))
+                            context_history_segments.append(UserMessageSegment(content=[TextPart(text=text_content)]))
                         elif role == 'assistant':
-                            context_history_segments.append(AssistantMessageSegment(content=[TextPart(text=content)]))
+                            context_history_segments.append(AssistantMessageSegment(content=[TextPart(text=text_content)]))
                 except Exception as e:
                     logger.warning(f"[消息防抖动] 解析历史记录失败: {e}")
         except Exception as e:
             logger.warning(f"[消息防抖动] 获取对话历史失败: {e}")
         
-        # 处理图片：检测是否支持视觉，如果不支持则使用图片转述
-        actual_image_urls = []
-        final_prompt = merged_msg
         
-        # 注意：这里我们仍然需要获取 provider 对象来检查视觉支持，
-        # 但 AstrBot 新 API 推荐直接使用 ID。
-        # 为了兼容性，我们尝试通过 ID 获取 provider 对象来检查视觉支持。
-        # 如果无法获取，默认假设不支持视觉（或者由 llm_generate 内部处理，但为了保险起见保留原有逻辑）
+        # 调用 LLM（先尝试直接传递图片，失败则降级到图片转述）
         try:
-            provider = self.context.get_provider_by_id(provider_id)
-            if img_urls:
-                # 检查当前 LLM 是否支持视觉输入
-                supports_vision = self._check_vision_support(provider)
-                
-                if supports_vision:
-                    # 当前模型支持视觉，直接传递图片 URL
-                    actual_image_urls = img_urls
-                    logger.info(f"[消息防抖动] 模型支持视觉，传递 {len(img_urls)} 张图片")
-                else:
-                    # 当前模型不支持视觉，尝试使用图片转述
-                    logger.info(f"[消息防抖动] 模型不支持视觉，尝试转述 {len(img_urls)} 张图片")
-                    image_descriptions = await self._process_images_with_caption(img_urls, unified_msg_origin)
-                    
-                    if image_descriptions:
-                        final_prompt = merged_msg + "\n\n" + "\n".join(image_descriptions)
-                        logger.info(f"[消息防抖动] 已添加 {len(image_descriptions)} 条图片描述")
-        except Exception as e:
-            logger.warning(f"[消息防抖动] 处理图片逻辑出错: {e}")
-            # 出错时降级处理：仅发送文本
-            final_prompt = merged_msg
-
-        # 调用 LLM
-        try:
-            # 使用 v4.5.7+ 新接口
-            # 注意：llm_generate 支持 image_urls 参数（透传给底层）
+            # 使用 v4.5.7+ 新接口，直接传递图片 URL
+            # llm_generate 会自动处理视觉支持检测
             llm_resp = await self.context.llm_generate(
                 chat_provider_id=provider_id,
-                prompt=final_prompt,
-                image_urls=actual_image_urls if actual_image_urls else None,
+                prompt=merged_msg,
+                image_urls=img_urls if img_urls else None,
                 system_prompt=system_prompt,
                 contexts=context_history_segments
             )
@@ -311,66 +322,70 @@ class ContinuousMessagePlugin(Star):
                 return None
             
             # 更新对话历史
-            try:
-                # 构造消息段
-                user_msg = UserMessageSegment(content=[TextPart(text=merged_msg)]) # 注意：这里存入历史的只存文本，避免图片URL过期或过长
-                assistant_msg = AssistantMessageSegment(content=[TextPart(text=response_text)])
-                
-                await conv_mgr.add_message_pair(
-                    cid=curr_cid,
-                    user_message=user_msg,
-                    assistant_message=assistant_msg,
-                )
-            except Exception as e:
-                logger.warning(f"[消息防抖动] 更新对话历史失败: {e}")
+            if curr_cid:
+                try:
+                    user_msg = UserMessageSegment(content=[TextPart(text=merged_msg)])
+                    assistant_msg = AssistantMessageSegment(content=[TextPart(text=response_text)])
+                    
+                    await conv_mgr.add_message_pair(
+                        cid=curr_cid,
+                        user_message=user_msg,
+                        assistant_message=assistant_msg,
+                    )
+                except Exception as e:
+                    logger.warning(f"[消息防抖动] 更新对话历史失败: {e}")
             
             return response_text
             
         except Exception as e:
+            # 如果有图片且调用失败，尝试使用图片转述
+            if img_urls:
+                logger.info(f"[消息防抖动] LLM 调用失败，尝试使用图片转述: {e}")
+                try:
+                    image_descriptions = await self._process_images_with_caption(img_urls, unified_msg_origin)
+                    
+                    if image_descriptions:
+                        # 重新构造带图片描述的提示词
+                        final_prompt = merged_msg + "\n\n" + "\n".join(image_descriptions)
+                        logger.info(f"[消息防抖动] 已添加 {len(image_descriptions)} 条图片描述，重新调用 LLM")
+                        
+                        # 重新调用 LLM（不带图片）
+                        llm_resp = await self.context.llm_generate(
+                            chat_provider_id=provider_id,
+                            prompt=final_prompt,
+                            system_prompt=system_prompt,
+                            contexts=context_history_segments
+                        )
+                        
+                        response_text = llm_resp.completion_text
+                        
+                        if response_text and curr_cid:
+                            try:
+                                user_msg = UserMessageSegment(content=[TextPart(text=merged_msg)])
+                                assistant_msg = AssistantMessageSegment(content=[TextPart(text=response_text)])
+                                await conv_mgr.add_message_pair(
+                                    cid=curr_cid,
+                                    user_message=user_msg,
+                                    assistant_message=assistant_msg,
+                                )
+                            except Exception as e2:
+                                logger.warning(f"[消息防抖动] 更新对话历史失败: {e2}")
+                        
+                        return response_text
+                except Exception as e2:
+                    logger.error(f"[消息防抖动] 图片转述也失败了: {e2}")
+            
             logger.error(f"[消息防抖动] LLM 请求失败: {e}", exc_info=True)
             return None
-
-    def _check_vision_support(self, provider) -> bool:
-        """
-        检查 LLM 提供商是否支持视觉输入
-        """
-        try:
-            # 检查 provider.provider_config (针对 ProviderOpenAIOfficial 等)
-            if hasattr(provider, 'provider_config') and isinstance(provider.provider_config, dict):
-                modalities = provider.provider_config.get('modalities', [])
-                if modalities and ('vision' in modalities or 'image' in modalities):
-                    return True
-                         
-        except Exception as e:
-            logger.warning(f"[消息防抖动] 检测视觉支持时出错: {e}")
-            
-        return False
 
     async def _process_images_with_caption(self, img_urls: List[str], unified_msg_origin: str) -> List[str]:
         """
         使用配置的图片转述提供商处理图片
         """
         image_descriptions = []
-        caption_provider_id = None
         
-        try:
-            # 1. 尝试从 provider_manager 获取配置
-            if hasattr(self.context, 'provider_manager'):
-                provider_mgr = self.context.provider_manager
-                
-                # 尝试从 provider_settings (dict) 获取
-                if hasattr(provider_mgr, 'provider_settings') and isinstance(provider_mgr.provider_settings, dict):
-                    caption_provider_id = provider_mgr.provider_settings.get('default_image_caption_provider_id')
-                
-                # 2. 如果失败，尝试从 context.get_config() 获取 (备选方案)
-                if not caption_provider_id:
-                    try:
-                        config = self.context.get_config(umo=unified_msg_origin)
-                        caption_provider_id = config.get('provider_settings', {}).get('default_image_caption_provider_id')
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.warning(f"[消息防抖动] 获取图片转述配置出错: {e}")
+        # 使用辅助方法获取图片转述提供商 ID
+        caption_provider_id = await self._get_caption_provider_id(unified_msg_origin)
 
         if not caption_provider_id:
             logger.warning(f"[消息防抖动] 未配置图片转述模型 (default_image_caption_provider_id)，图片将被忽略")
