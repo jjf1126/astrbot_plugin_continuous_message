@@ -170,8 +170,13 @@ class ContinuousMessagePlugin(Star):
         display_msg = text[:50] if text else "[图片]"
         logger.info(f"[消息防抖动] 处理消息: {display_msg}")
         
-        # 普通消息或图片：接管处理，阻止后续默认流程
-        ev.stop_event()
+        # 修改消息内容而非阻断事件，保持与分段回复等功能的兼容性
+        try:
+            from astrbot.api.message_components import Plain
+            ev.message_obj.message = [Plain("")]
+            ev.message_str = ""
+        except Exception as e:
+            logger.warning(f"[消息防抖动] 清空消息内容失败: {e}")
         
         # 如果有文本，加入缓冲区
         if text:
@@ -259,15 +264,7 @@ class ContinuousMessagePlugin(Star):
         
         if img_urls:
             # 检查当前 LLM 是否支持视觉输入
-            supports_vision = False
-            try:
-                if hasattr(provider, 'modalities'):
-                    supports_vision = 'vision' in provider.modalities or 'image' in provider.modalities
-                elif hasattr(provider, 'config') and isinstance(provider.config, dict):
-                    modalities = provider.config.get('modalities', [])
-                    supports_vision = 'vision' in modalities or 'image' in modalities
-            except Exception as e:
-                logger.warning(f"[消息防抖动] 检测视觉支持时出错: {e}")
+            supports_vision = self._check_vision_support(provider)
             
             if supports_vision:
                 # 当前模型支持视觉，直接传递图片 URL
@@ -283,7 +280,7 @@ class ContinuousMessagePlugin(Star):
                     logger.info(f"[消息防抖动] 已添加 {len(image_descriptions)} 条图片描述")
         
         # 打印最终发送的内容（调试用）
-        logger.info(f"[消息防抖动] 最终发送给 LLM 的内容:\n{final_prompt}")
+        # logger.debug(f"[消息防抖动] 最终发送给 LLM 的内容:\n{final_prompt}")
 
         # 调用 LLM
         try:
@@ -318,6 +315,22 @@ class ContinuousMessagePlugin(Star):
         except Exception as e:
             logger.error(f"[消息防抖动] LLM 请求失败: {e}", exc_info=True)
             return None
+
+    def _check_vision_support(self, provider) -> bool:
+        """
+        检查 LLM 提供商是否支持视觉输入
+        """
+        try:
+            # 检查 provider.provider_config (针对 ProviderOpenAIOfficial 等)
+            if hasattr(provider, 'provider_config') and isinstance(provider.provider_config, dict):
+                modalities = provider.provider_config.get('modalities', [])
+                if modalities and ('vision' in modalities or 'image' in modalities):
+                    return True
+                         
+        except Exception as e:
+            logger.warning(f"[消息防抖动] 检测视觉支持时出错: {e}")
+            
+        return False
 
     async def _process_images_with_caption(self, img_urls: List[str], unified_msg_origin: str) -> List[str]:
         """
@@ -480,9 +493,6 @@ class ContinuousMessagePlugin(Star):
 
             logger.info(f"[消息防抖动] 防抖超时，合并了 {len(buffer)} 条消息，图片数: {len(image_urls)}")
             
-            # 接管这轮消息
-            event.stop_event()
-            
             # 调用 LLM
             unified_msg_origin = event.unified_msg_origin
             response_text = await self._send_to_llm(merged_message, image_urls, unified_msg_origin)
@@ -494,5 +504,4 @@ class ContinuousMessagePlugin(Star):
         
         except Exception as e:
             logger.error(f"[消息防抖动] 插件内部错误: {e}", exc_info=True)
-            event.stop_event()
             yield event.plain_result(f"插件内部错误: {str(e)}")
