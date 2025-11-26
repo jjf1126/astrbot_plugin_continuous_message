@@ -253,13 +253,45 @@ class ContinuousMessagePlugin(Star):
             logger.warning(f"[消息防抖动] 获取对话历史失败: {e}")
             context_history = []
         
+        # 处理图片：检测是否支持视觉，如果不支持则使用图片转述
+        actual_image_urls = []
+        final_prompt = merged_msg
+        
+        if img_urls:
+            # 检查当前 LLM 是否支持视觉输入
+            supports_vision = False
+            try:
+                if hasattr(provider, 'modalities'):
+                    supports_vision = 'vision' in provider.modalities or 'image' in provider.modalities
+                elif hasattr(provider, 'config') and isinstance(provider.config, dict):
+                    modalities = provider.config.get('modalities', [])
+                    supports_vision = 'vision' in modalities or 'image' in modalities
+            except Exception as e:
+                logger.warning(f"[消息防抖动] 检测视觉支持时出错: {e}")
+            
+            if supports_vision:
+                # 当前模型支持视觉，直接传递图片 URL
+                actual_image_urls = img_urls
+                logger.info(f"[消息防抖动] 模型支持视觉，传递 {len(img_urls)} 张图片")
+            else:
+                # 当前模型不支持视觉，尝试使用图片转述
+                logger.info(f"[消息防抖动] 模型不支持视觉，尝试转述 {len(img_urls)} 张图片")
+                image_descriptions = await self._process_images_with_caption(img_urls, unified_msg_origin)
+                
+                if image_descriptions:
+                    final_prompt = merged_msg + "\n\n" + "\n".join(image_descriptions)
+                    logger.info(f"[消息防抖动] 已添加 {len(image_descriptions)} 条图片描述")
+        
+        # 打印最终发送的内容（调试用）
+        logger.info(f"[消息防抖动] 最终发送给 LLM 的内容:\n{final_prompt}")
+
         # 调用 LLM
         try:
             response = await provider.text_chat(
-                prompt=merged_msg,
+                prompt=final_prompt,
                 context=context_history,
                 system_prompt=system_prompt,
-                image_urls=img_urls if img_urls else None
+                image_urls=actual_image_urls if actual_image_urls else None
             )
             
             # 获取响应文本
@@ -286,8 +318,61 @@ class ContinuousMessagePlugin(Star):
         except Exception as e:
             logger.error(f"[消息防抖动] LLM 请求失败: {e}", exc_info=True)
             return None
+
+    async def _process_images_with_caption(self, img_urls: List[str], unified_msg_origin: str) -> List[str]:
+        """
+        使用配置的图片转述提供商处理图片
+        """
+        image_descriptions = []
+        caption_provider = None
+        
+        try:
+            # 1. 尝试从 provider_manager 获取配置
+            if hasattr(self.context, 'provider_manager'):
+                provider_mgr = self.context.provider_manager
+                caption_provider_id = None
+                
+                # 尝试从 provider_settings (dict) 获取
+                if hasattr(provider_mgr, 'provider_settings') and isinstance(provider_mgr.provider_settings, dict):
+                    caption_provider_id = provider_mgr.provider_settings.get('default_image_caption_provider_id')
+                
+                # 2. 如果失败，尝试从 context.get_config() 获取 (备选方案)
+                if not caption_provider_id:
+                    try:
+                        config = self.context.get_config(umo=unified_msg_origin)
+                        caption_provider_id = config.get('provider_settings', {}).get('default_image_caption_provider_id')
+                    except Exception:
+                        pass
+                
+                if caption_provider_id:
+                    caption_provider = self.context.get_provider_by_id(caption_provider_id)
+        except Exception as e:
+            logger.warning(f"[消息防抖动] 获取图片转述配置出错: {e}")
+
+        if not caption_provider:
+            logger.warning(f"[消息防抖动] 未配置图片转述模型 (default_image_caption_provider_id)，图片将被忽略")
+            return []
+
+        # 使用找到的提供商转述图片
+        for i, img_url in enumerate(img_urls):
+            try:
+                # logger.debug(f"[消息防抖动] 转述第 {i+1} 张图片...")
+                caption_response = await caption_provider.text_chat(
+                    prompt="请简要描述这张图片的内容。",
+                    image_urls=[img_url]
+                )
+                description = self._extract_response_text(caption_response)
+                if description:
+                    image_descriptions.append(f"[图片描述 {i+1}: {description}]")
+                else:
+                    image_descriptions.append(f"[图片 {i+1} 转述失败]")
+            except Exception as e:
+                logger.warning(f"[消息防抖动] 图片 {i+1} 转述失败: {e}")
+                image_descriptions.append(f"[图片 {i+1} 处理出错]")
+        
+        return image_descriptions
     
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=100)
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=50)
     async def handle_private_msg(self, event: AstrMessageEvent):
         """
         私聊消息防抖逻辑（仅私聊可用，避免群聊越权问题）
