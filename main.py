@@ -1,18 +1,27 @@
 import asyncio
+import json
 from typing import List, Tuple, Dict, Optional
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api import AstrBotConfig, logger
+import astrbot.api.message_components as Comp
+
+# 检查是否为 aiocqhttp 平台，因为合并转发是其特性
+try:
+    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+    IS_AIOCQHTTP = True
+except ImportError:
+    IS_AIOCQHTTP = False
 
 @register(
     "continuous_message",
     "aliveriver",
-    "将用户短时间内发送的多条私聊消息合并成一条发送给LLM（仅私聊模式）",
-    "2.0.0"
+    "将用户短时间内发送的多条私聊消息合并成一条发送给LLM（仅私聊模式，支持合并转发消息）",
+    "2.1.0"
 )
 class ContinuousMessagePlugin(Star):
     """
-    消息防抖动插件 v2.0.0
+    消息防抖动插件 v2.1.0
     消息防抖动插件（仅私聊模式）
     
     功能：
@@ -21,6 +30,7 @@ class ContinuousMessagePlugin(Star):
     3. 过滤指令消息，不参与合并
     4. 保持人格设定和对话历史
     5. 支持图片识别和传递
+    6. 支持QQ合并转发消息的提取和合并（aiocqhttp平台）
 
     安全设计：
     - 强制仅在私聊启用，避免群聊中不同用户的消息被误合并
@@ -34,6 +44,8 @@ class ContinuousMessagePlugin(Star):
         self.command_prefixes = self.config.get('command_prefixes', ['/'])
         self.enable_plugin = self.config.get('enable', True)
         self.merge_separator = self.config.get('merge_separator', '\n')
+        self.enable_forward_analysis = self.config.get('enable_forward_analysis', True)
+        self.forward_prefix = self.config.get('forward_prefix', '【合并转发内容】\n')
         
         # 会话存储结构:
         # {
@@ -61,7 +73,7 @@ class ContinuousMessagePlugin(Star):
             except ImportError:
                 logger.error("[消息防抖动] 严重: 组件导入失败")
 
-        logger.info(f"[消息防抖动] v2.0.0 加载 | 事件驱动模式 | 防抖: {self.debounce_time}s")
+        logger.info(f"[消息防抖动] v2.1.0 加载 | 事件驱动模式 | 防抖: {self.debounce_time}s | 合并消息: {self.enable_forward_analysis}")
 
     def is_command(self, message: str) -> bool:
         message = message.strip()
@@ -72,7 +84,7 @@ class ContinuousMessagePlugin(Star):
 
     def _parse_message(self, message_obj) -> Tuple[str, bool, List[str]]:
         """
-        解析消息对象，提取文本和图片信息
+        解析消息对象，提取文本、图片和合并转发信息
         
         Returns:
             (文本内容, 是否包含图片, 图片URL列表)
@@ -83,7 +95,7 @@ class ContinuousMessagePlugin(Star):
         try:
             if not hasattr(message_obj, "message"): return "", False, []
             
-            # 遍历消息组件，提取文本和图片
+            # 遍历消息组件，提取文本、图片和合并转发
             for component in message_obj.message:
                 # 提取文本内容（支持多种属性名）
                 if hasattr(component, 'text') and component.text:
@@ -155,9 +167,31 @@ class ContinuousMessagePlugin(Star):
     async def handle_private_msg(self, event: AstrMessageEvent):
         if not self.enable_plugin or self.debounce_time <= 0: return
 
+        # 0. 检测并处理合并转发消息（仅aiocqhttp平台）
+        forward_text = ""
+        forward_images = []
+        if self.enable_forward_analysis and IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
+            forward_id = await self._detect_forward_message(event)
+            if forward_id:
+                try:
+                    forward_text, forward_images = await self._extract_forward_content(event, forward_id)
+                    if forward_text or forward_images:
+                        logger.info(f"[消息防抖动] 检测到合并转发 | 文本: {len(forward_text)}字 | 图片: {len(forward_images)}张")
+                except Exception as e:
+                    logger.error(f"[消息防抖动] 提取合并转发失败: {e}")
+
         # 1. 解析消息内容
         raw_text, has_image, current_urls = self._parse_message(event.message_obj)
         if not raw_text: raw_text = (event.message_str or "").strip()
+        
+        # 合并转发内容处理：如果有合并转发内容，添加到文本和图片中
+        if forward_text:
+            prefix_text = self.forward_prefix + forward_text
+            raw_text = prefix_text + ("\n" + raw_text if raw_text else "")
+        if forward_images:
+            current_urls.extend(forward_images)
+            has_image = True
+        
         uid = event.unified_msg_origin
 
         # 2. 处理指令消息：立即中断当前防抖会话并结算
@@ -239,3 +273,140 @@ class ContinuousMessagePlugin(Star):
         # 重构后的事件会继续传播给后续插件/框架，由它们处理 LLM 调用
         self._reconstruct_event(event, merged_text, all_images)
         return
+
+    async def _detect_forward_message(self, event: AiocqhttpMessageEvent) -> Optional[str]:
+        """
+        检测消息中是否包含合并转发消息
+        
+        支持两种场景：
+        1. 用户直接发送合并转发消息
+        2. 用户回复了一条合并转发消息
+        
+        Returns:
+            合并转发消息的ID，如果没有则返回None
+        """
+        # 场景1: 直接发送的合并转发
+        for seg in event.message_obj.message:
+            if isinstance(seg, Comp.Forward):
+                return seg.id
+        
+        # 场景2: 回复的合并转发
+        reply_seg = None
+        for seg in event.message_obj.message:
+            if isinstance(seg, Comp.Reply):
+                reply_seg = seg
+                break
+        
+        if reply_seg:
+            try:
+                client = event.bot
+                original_msg = await client.api.call_action('get_msg', message_id=reply_seg.id)
+                
+                if original_msg and 'message' in original_msg:
+                    original_message_chain = original_msg['message']
+                    if isinstance(original_message_chain, list):
+                        for segment in original_message_chain:
+                            if isinstance(segment, dict) and segment.get("type") == "forward":
+                                return segment.get("data", {}).get("id")
+            except Exception as e:
+                logger.debug(f"[消息防抖动] 获取被回复消息失败: {e}")
+        
+        return None
+
+    async def _extract_forward_content(
+        self, 
+        event: AiocqhttpMessageEvent, 
+        forward_id: str
+    ) -> Tuple[str, List[str]]:
+        """
+        从合并转发消息中提取文本和图片URL
+        
+        Args:
+            event: aiocqhttp消息事件对象
+            forward_id: 合并转发消息的ID
+            
+        Returns:
+            (格式化的文本内容, 图片URL列表)
+        """
+        client = event.bot
+        
+        try:
+            forward_data = await client.api.call_action('get_forward_msg', id=forward_id)
+        except Exception as e:
+            logger.error(f"[消息防抖动] 调用 get_forward_msg API 失败: {e}")
+            raise ValueError("获取合并转发内容失败，可能是消息已过期或API问题")
+
+        if not forward_data or "messages" not in forward_data:
+            raise ValueError("获取到的合并转发内容为空")
+
+        extracted_texts = []
+        image_urls = []
+
+        for message_node in forward_data["messages"]:
+            sender_name = message_node.get("sender", {}).get("nickname", "未知用户")
+            # 兼容 'message' 和 'content' 两个可能的键
+            raw_content = message_node.get("message") or message_node.get("content", [])
+
+            # 解析消息内容（可能是字符串或列表）
+            content_chain = self._parse_raw_content(raw_content)
+            
+            # 提取文本和图片
+            node_text_parts = []
+            for segment in content_chain:
+                if not isinstance(segment, dict):
+                    continue
+                    
+                seg_type = segment.get("type")
+                seg_data = segment.get("data", {})
+                
+                if seg_type == "text":
+                    text = seg_data.get("text", "")
+                    if text:
+                        node_text_parts.append(text)
+                
+                elif seg_type == "image":
+                    url = seg_data.get("url")
+                    if url:
+                        image_urls.append(url)
+                        node_text_parts.append("[图片]")
+            
+            full_node_text = "".join(node_text_parts).strip()
+            if full_node_text:
+                extracted_texts.append(f"{sender_name}: {full_node_text}")
+
+        # 返回格式化的文本内容和图片列表
+        return "\n".join(extracted_texts), image_urls
+
+    def _parse_raw_content(self, raw_content) -> List[dict]:
+        """
+        解析原始消息内容
+        
+        支持的格式：
+        1. 列表形式: [{"type": "text", "data": {...}}, ...]
+        2. JSON字符串: '[{"type": "text", ...}]'
+        3. 纯文本字符串: "hello world"
+        
+        Args:
+            raw_content: 原始消息内容（字符串或列表）
+            
+        Returns:
+            标准化的消息链列表
+        """
+        # 如果已经是列表，直接返回
+        if isinstance(raw_content, list):
+            return raw_content
+        
+        # 如果是字符串，尝试解析为JSON
+        if isinstance(raw_content, str):
+            try:
+                parsed_content = json.loads(raw_content)
+                if isinstance(parsed_content, list):
+                    return parsed_content
+            except (json.JSONDecodeError, TypeError):
+                pass
+            
+            # 解析失败，当作纯文本处理
+            return [{"type": "text", "data": {"text": raw_content}}]
+        
+        # 其他情况返回空列表
+        return []
