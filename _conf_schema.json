@@ -25,5 +25,18 @@
     "type": "string",
     "default": "\n",
     "hint": "多条消息合并时使用的分隔符，默认为换行符"
+  },
+  "enable_forward_analysis": {
+    "description": "启用合并转发消息分析",
+    "type": "bool",
+    "default": true,
+    "hint": "是否自动提取QQ合并转发消息的内容并纳入防抖处理（仅aiocqhttp平台支持）",
+    "obvious_hint": true
+  },
+  "forward_prefix": {
+    "description": "合并转发内容前缀",
+    "type": "string",
+    "default": "【合并转发内容】\n",
+    "hint": "在提取的合并转发内容前添加的标识前缀"
   }
 }
