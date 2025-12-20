@@ -46,6 +46,9 @@ class ContinuousMessagePlugin(Star):
         self.merge_separator = self.config.get('merge_separator', '\n')
         self.enable_forward_analysis = self.config.get('enable_forward_analysis', True)
         self.forward_prefix = self.config.get('forward_prefix', '【合并转发内容】\n')
+        # 引用消息格式（硬编码，避免用户填写错误）
+        self.reply_format = '[引用消息({sender_name}: {full_text})]'
+        self.bot_reply_hint = self.config.get('bot_reply_hint', '[系统提示：以上引用的消息是你(助手)之前发送的内容，不是用户说的话]')
         
         # 会话存储结构:
         # {
@@ -97,6 +100,10 @@ class ContinuousMessagePlugin(Star):
             
             # 遍历消息组件，提取文本、图片和合并转发
             for component in message_obj.message:
+                # 跳过Reply组件（引用消息由_extract_reply_content单独处理）
+                if component.__class__.__name__ == 'Reply':
+                    continue
+                
                 # 提取文本内容（支持多种属性名）
                 if hasattr(component, 'text') and component.text:
                     text += component.text
@@ -108,7 +115,7 @@ class ContinuousMessagePlugin(Star):
                 if self._ImageComponent and isinstance(component, self._ImageComponent): is_img = True
                 elif component.__class__.__name__ == 'Image': is_img = True
                 
-                # 提取图片URL（支持 url 或 file 属性）
+                # 提取图片URL
                 if is_img:
                     has_image = True
                     if hasattr(component, 'url') and component.url: image_urls.append(component.url)
@@ -179,6 +186,12 @@ class ContinuousMessagePlugin(Star):
                         logger.info(f"[消息防抖动] 检测到合并转发 | 文本: {len(forward_text)}字 | 图片: {len(forward_images)}张")
                 except Exception as e:
                     logger.error(f"[消息防抖动] 提取合并转发失败: {e}")
+            else:
+                # 检测普通引用消息（非合并转发）
+                reply_text, reply_images = await self._extract_reply_content(event)
+                if reply_text or reply_images:
+                    forward_text = reply_text
+                    forward_images = reply_images
 
         # 1. 解析消息内容
         raw_text, has_image, current_urls = self._parse_message(event.message_obj)
@@ -186,8 +199,14 @@ class ContinuousMessagePlugin(Star):
         
         # 合并转发内容处理：如果有合并转发内容，添加到文本和图片中
         if forward_text:
-            prefix_text = self.forward_prefix + forward_text
-            raw_text = prefix_text + ("\n" + raw_text if raw_text else "")
+            # 判断是否为普通引用消息（以[引用消息开头）还是合并转发
+            if forward_text.startswith('[引用消息('):
+                # 普通引用消息，不添加合并转发前缀，直接拼接
+                raw_text = forward_text + ("\n" + raw_text if raw_text else "")
+            else:
+                # 合并转发消息，添加前缀
+                prefix_text = self.forward_prefix + forward_text
+                raw_text = prefix_text + ("\n" + raw_text if raw_text else "")
         if forward_images:
             current_urls.extend(forward_images)
             has_image = True
@@ -264,10 +283,15 @@ class ContinuousMessagePlugin(Star):
         merged_text = self.merge_separator.join(buffer).strip()
         
         # 4. 合并消息并重构事件对象
-        if not merged_text and not all_images: return  # 空数据直接返回
+        if not merged_text and not all_images: return
 
         img_info = f" + {len(all_images)}图" if all_images else ""
         logger.info(f"[消息防抖动] 结算触发 - 共 {len(buffer)} 条{img_info} -> 发送")
+        
+        # Debug: 输出最终合并的消息内容
+        logger.info(f"[消息防抖动] 合并后的完整消息:\n{merged_text}")
+        if all_images:
+            logger.debug(f"[消息防抖动] 图片列表: {all_images}")
         
         # 重构事件：将合并后的文本和图片重新组装到事件中
         # 重构后的事件会继续传播给后续插件/框架，由它们处理 LLM 调用
@@ -313,6 +337,113 @@ class ContinuousMessagePlugin(Star):
         
         return None
 
+    async def _extract_reply_content(
+        self,
+        event: AiocqhttpMessageEvent
+    ) -> Tuple[str, List[str]]:
+        """
+        提取被引用的普通消息内容（非合并转发）
+        
+        Args:
+            event: aiocqhttp消息事件对象
+            
+        Returns:
+            (格式化的文本内容, 图片URL列表)
+        """
+        # 查找Reply组件
+        reply_seg = None
+        for seg in event.message_obj.message:
+            if isinstance(seg, Comp.Reply):
+                reply_seg = seg
+                break
+        
+        if not reply_seg:
+            return "", []
+        
+        try:
+            client = event.bot
+            # 获取被引用的原始消息
+            original_msg = await client.api.call_action('get_msg', message_id=reply_seg.id)
+            
+            if not original_msg or 'message' not in original_msg:
+                return "", []
+            
+            # 获取发送者信息
+            sender_id = original_msg.get('sender', {}).get('user_id')
+            sender_name = original_msg.get('sender', {}).get('nickname', '未知用户')
+            
+            # 检查发送者是否是bot自己
+            # 通过比较sender_id和bot的self_id来判断
+            bot_id = None
+            try:
+                # 使用框架自带的消息对象获取bot ID
+                if hasattr(event, 'message_obj') and hasattr(event.message_obj, 'self_id'):
+                    bot_id = event.message_obj.self_id
+                    # 转换为整数以便比较（sender_id可能是int）
+                    if bot_id:
+                        try:
+                            bot_id = int(bot_id) if isinstance(bot_id, str) else bot_id
+                        except (ValueError, TypeError):
+                            pass
+            except Exception as e:
+                logger.debug(f"[消息防抖动] 获取bot ID失败: {e}")
+                bot_id = None
+            
+            # 确保sender_id也是整数类型
+            if isinstance(sender_id, str):
+                try:
+                    sender_id = int(sender_id)
+                except (ValueError, TypeError):
+                    pass
+            
+            is_bot_message = (bot_id is not None and sender_id == bot_id)
+            
+            # 调试日志：输出sender_id和bot_id的比较结果
+            logger.info(f"[消息防抖动] 引用消息判断 | sender_id: {sender_id}, bot_id: {bot_id}, is_bot_message: {is_bot_message}, sender_name: {sender_name}")
+            
+            # 解析消息内容
+            original_message_chain = original_msg['message']
+            content_chain = self._parse_raw_content(original_message_chain)
+            
+            # 提取文本和图片
+            text_parts = []
+            image_urls = []
+            
+            for segment in content_chain:
+                if not isinstance(segment, dict):
+                    continue
+                
+                seg_type = segment.get("type")
+                seg_data = segment.get("data", {})
+                
+                if seg_type == "text":
+                    text = seg_data.get("text", "")
+                    if text:
+                        text_parts.append(text)
+                
+                elif seg_type == "image":
+                    url = seg_data.get("url")
+                    if url:
+                        image_urls.append(url)
+                        text_parts.append("[图片]")
+            
+            full_text = "".join(text_parts).strip()
+            
+            if not full_text:
+                return "", image_urls
+            
+            # 格式化文本，如果是bot自己的消息，添加特殊标记
+            if is_bot_message:
+                formatted_text = self.reply_format.format(sender_name=sender_name, full_text=full_text) + "\n" + self.bot_reply_hint
+            else:
+                formatted_text = self.reply_format.format(sender_name=sender_name, full_text=full_text)
+            
+            return formatted_text, image_urls
+            
+        except Exception as e:
+            logger.debug(f"[消息防抖动] 提取引用消息失败: {e}")
+            return "", []
+
     async def _extract_forward_content(
         self, 
         event: AiocqhttpMessageEvent, 
@@ -337,17 +468,23 @@ class ContinuousMessagePlugin(Star):
             raise ValueError("获取合并转发内容失败，可能是消息已过期或API问题")
 
         if not forward_data or "messages" not in forward_data:
+            logger.error(f"[消息防抖动] forward_data 无效或缺少 messages 字段")
             raise ValueError("获取到的合并转发内容为空")
+        
+        # 检查是否为空数组（NapCat可能不支持或配置问题）
+        if len(forward_data['messages']) == 0:
+            logger.warning(f"[消息防抖动] NapCat返回的messages为空数组，可能是API限制或配置问题")
+            return "", []
 
         extracted_texts = []
         image_urls = []
 
         for message_node in forward_data["messages"]:
+            logger.debug(f"[消息防抖动] 处理消息节点: {message_node}")
             sender_name = message_node.get("sender", {}).get("nickname", "未知用户")
+            
             # 兼容 'message' 和 'content' 两个可能的键
             raw_content = message_node.get("message") or message_node.get("content", [])
-
-            # 解析消息内容（可能是字符串或列表）
             content_chain = self._parse_raw_content(raw_content)
             
             # 提取文本和图片
@@ -371,10 +508,12 @@ class ContinuousMessagePlugin(Star):
                         node_text_parts.append("[图片]")
             
             full_node_text = "".join(node_text_parts).strip()
+            logger.debug(f"[消息防抖动] 节点提取的文本: '{full_node_text}'")
             if full_node_text:
                 extracted_texts.append(f"{sender_name}: {full_node_text}")
+            else:
+                logger.warning(f"[消息防抖动] 节点没有文本内容，跳过")
 
-        # 返回格式化的文本内容和图片列表
         return "\n".join(extracted_texts), image_urls
 
     def _parse_raw_content(self, raw_content) -> List[dict]:
@@ -392,7 +531,6 @@ class ContinuousMessagePlugin(Star):
         Returns:
             标准化的消息链列表
         """
-        # 如果已经是列表，直接返回
         if isinstance(raw_content, list):
             return raw_content
         

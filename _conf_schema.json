@@ -16,7 +16,9 @@
   "command_prefixes": {
     "description": "指令前缀列表",
     "type": "list",
-    "default": ["/"],
+    "default": [
+      "/"
+    ],
     "hint": "以这些前缀开头的消息会被识别为指令，不会被合并。默认为 ['/']",
     "invisible": false
   },
@@ -38,5 +40,11 @@
     "type": "string",
     "default": "【合并转发内容】\n",
     "hint": "在提取的合并转发内容前添加的标识前缀"
+  },
+  "bot_reply_hint": {
+    "description": "Bot自己消息的引用提示",
+    "type": "string",
+    "default": "[系统提示：以上引用的消息是你(助手)之前发送的内容，不是用户说的话]",
+    "hint": "当用户引用Bot自己发送的消息时，附加的系统提示词，用于提醒LLM这是它自己说的话"
   }
 }
