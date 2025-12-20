@@ -16,12 +16,12 @@ except ImportError:
 @register(
     "continuous_message",
     "aliveriver",
-    "将用户短时间内发送的多条私聊消息合并成一条发送给LLM（仅私聊模式，支持合并转发消息）",
-    "2.1.0"
+    "将用户短时间内发送的多条私聊消息合并成一条发送给LLM（仅私聊模式，支持合并转发消息、引用消息）",
+    "2.1.1"
 )
 class ContinuousMessagePlugin(Star):
     """
-    消息防抖动插件 v2.1.0
+    消息防抖动插件 v2.1.1
     消息防抖动插件（仅私聊模式）
     
     功能：
@@ -31,6 +31,7 @@ class ContinuousMessagePlugin(Star):
     4. 保持人格设定和对话历史
     5. 支持图片识别和传递
     6. 支持QQ合并转发消息的提取和合并（aiocqhttp平台）
+    7. 支持QQ引用消息的智能识别和上下文标注（aiocqhttp平台）
 
     安全设计：
     - 强制仅在私聊启用，避免群聊中不同用户的消息被误合并
@@ -76,7 +77,7 @@ class ContinuousMessagePlugin(Star):
             except ImportError:
                 logger.error("[消息防抖动] 严重: 组件导入失败")
 
-        logger.info(f"[消息防抖动] v2.1.0 加载 | 事件驱动模式 | 防抖: {self.debounce_time}s | 合并消息: {self.enable_forward_analysis}")
+        logger.info(f"[消息防抖动] v2.1.1 加载 | 事件驱动模式 | 防抖: {self.debounce_time}s | 合并消息: {self.enable_forward_analysis}")
 
     def is_command(self, message: str) -> bool:
         message = message.strip()
@@ -399,7 +400,7 @@ class ContinuousMessagePlugin(Star):
             is_bot_message = (bot_id is not None and sender_id == bot_id)
             
             # 调试日志：输出sender_id和bot_id的比较结果
-            logger.info(f"[消息防抖动] 引用消息判断 | sender_id: {sender_id}, bot_id: {bot_id}, is_bot_message: {is_bot_message}, sender_name: {sender_name}")
+            logger.debug(f"[消息防抖动] 引用消息判断 | sender_id: {sender_id}, bot_id: {bot_id}, is_bot_message: {is_bot_message}, sender_name: {sender_name}")
             
             # 解析消息内容
             original_message_chain = original_msg['message']
