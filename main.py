@@ -53,7 +53,6 @@ class ContinuousMessagePlugin(Star):
         self.bot_reply_hint = self.config.get('bot_reply_hint', '[系统提示：以上引用的消息是你(助手)之前发送的内容，不是用户说的话]')
         # 输入状态感知配置
         self.enable_typing_detection = self.config.get('enable_typing_detection', True)
-        self.typing_extra_wait = float(self.config.get('typing_extra_wait', 3.0))
         
         # 会话存储结构:
         # {
@@ -186,32 +185,39 @@ class ContinuousMessagePlugin(Star):
             if uid in self.sessions:
                 self.sessions[uid]['flush_event'].set()
         except asyncio.CancelledError:
-            # 任务被取消（说明有新消息到来，计时器需要重置）
-            # 直接退出即可，新消息会创建新的计时器
             pass
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=50)
     async def handle_private_msg(self, event: AstrMessageEvent):
         if not self.enable_plugin or self.debounce_time <= 0: return
 
-        # 0a. 输入状态检测：如果用户正在输入，延长防抖等待时间
+        # 0a. 输入状态检测：根据 status_text 判断用户是否正在输入
         if self.enable_typing_detection and self._is_typing_event(event):
             raw = event.message_obj.raw_message
             status_text = raw.get('status_text', '')
-            event_type = raw.get('event_type', '')
             user_id = raw.get('user_id', '')
             uid = event.unified_msg_origin
             has_session = uid in self.sessions
-            logger.info(f"[消息防抖动] 收到输入状态通知 | user_id: {user_id} | status_text: {status_text} | event_type: {event_type} | 有活跃会话: {has_session}")
+            is_typing = '正在输入' in status_text
+            logger.debug(f"[消息防抖动] 输入状态通知 | user_id: {user_id} | status_text: {status_text} | is_typing: {is_typing} | 有活跃会话: {has_session}")
             if has_session:
                 session = self.sessions[uid]
-                # 取消当前计时器，用更长的等待时间重新创建
-                if session.get('timer_task'):
-                    session['timer_task'].cancel()
-                session['timer_task'] = asyncio.create_task(
-                    self._timer_coroutine(uid, self.typing_extra_wait)
-                )
-                logger.info(f"[消息防抖动] 延长防抖等待 {self.typing_extra_wait}s - 用户: {uid}")
+                if is_typing:
+                    # 正在输入：取消计时器，暂停结算
+                    session['is_typing'] = True
+                    if session.get('timer_task'):
+                        session['timer_task'].cancel()
+                        session['timer_task'] = None
+                    logger.info(f"[消息防抖动] 用户正在输入，暂停结算 - 用户: {uid}")
+                else:
+                    # 停止输入：恢复正常防抖倒计时
+                    session['is_typing'] = False
+                    if session.get('timer_task'):
+                        session['timer_task'].cancel()
+                    session['timer_task'] = asyncio.create_task(
+                        self._timer_coroutine(uid, self.debounce_time)
+                    )
+                    logger.info(f"[消息防抖动] 用户停止输入，恢复防抖 {self.debounce_time}s - 用户: {uid}")
             # 无论是否有活跃会话，都阻止输入状态事件继续传播
             event.stop_event()
             return
@@ -304,7 +310,8 @@ class ContinuousMessagePlugin(Star):
             'buffer': [raw_text] if raw_text else [],  # 文本消息缓冲区
             'images': current_urls,                    # 图片URL列表
             'flush_event': flush_event,                # 结算触发事件
-            'timer_task': timer_task                   # 当前计时器任务
+            'timer_task': timer_task,                   # 当前计时器任务
+            'is_typing': False                         # 用户是否正在输入
         }
         
         logger.info(f"[消息防抖动] 开始收集 - 用户: {uid}")

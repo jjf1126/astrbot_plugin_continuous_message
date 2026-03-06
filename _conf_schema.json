@@ -53,11 +53,5 @@
     "default": true,
     "hint": "检测到用户正在输入时自动延长防抖等待时间，避免用户还在打字就触发结算（仅NapCat等支持input_status的平台有效）",
     "obvious_hint": true
-  },
-  "typing_extra_wait": {
-    "description": "输入状态额外等待时间（秒）",
-    "type": "float",
-    "default": 3.0,
-    "hint": "检测到用户正在输入后，计时器会重置为此等待时间。建议设置为 2.0-5.0 秒"
   }
 }
