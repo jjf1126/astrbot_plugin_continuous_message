@@ -16,12 +16,12 @@ except ImportError:
 @register(
     "continuous_message",
     "aliveriver",
-    "将用户短时间内发送的多条私聊消息合并成一条发送给LLM（仅私聊模式，支持合并转发消息、引用消息）",
-    "2.1.1"
+    "将用户短时间内发送的多条私聊消息合并成一条发送给LLM（仅私聊模式，支持合并转发消息、引用消息、输入状态感知）",
+    "2.2.0"
 )
 class ContinuousMessagePlugin(Star):
     """
-    消息防抖动插件 v2.1.1
+    消息防抖动插件 v2.2.0
     消息防抖动插件（仅私聊模式）
     
     功能：
@@ -32,6 +32,7 @@ class ContinuousMessagePlugin(Star):
     5. 支持图片识别和传递
     6. 支持QQ合并转发消息的提取和合并（aiocqhttp平台）
     7. 支持QQ引用消息的智能识别和上下文标注（aiocqhttp平台）
+    8. 支持输入状态感知，检测到用户正在打字时自动延长等待（NapCat等支持input_status的平台）
 
     安全设计：
     - 强制仅在私聊启用，避免群聊中不同用户的消息被误合并
@@ -50,6 +51,9 @@ class ContinuousMessagePlugin(Star):
         # 引用消息格式（硬编码，避免用户填写错误）
         self.reply_format = '[引用消息({sender_name}: {full_text})]'
         self.bot_reply_hint = self.config.get('bot_reply_hint', '[系统提示：以上引用的消息是你(助手)之前发送的内容，不是用户说的话]')
+        # 输入状态感知配置
+        self.enable_typing_detection = self.config.get('enable_typing_detection', True)
+        self.typing_extra_wait = float(self.config.get('typing_extra_wait', 3.0))
         
         # 会话存储结构:
         # {
@@ -77,7 +81,7 @@ class ContinuousMessagePlugin(Star):
             except ImportError:
                 logger.error("[消息防抖动] 严重: 组件导入失败")
 
-        logger.info(f"[消息防抖动] v2.1.1 加载 | 事件驱动模式 | 防抖: {self.debounce_time}s | 合并消息: {self.enable_forward_analysis}")
+        logger.info(f"[消息防抖动] v2.2.0 加载 | 事件驱动模式 | 防抖: {self.debounce_time}s | 合并消息: {self.enable_forward_analysis} | 输入感知: {self.enable_typing_detection}")
 
     def is_command(self, message: str) -> bool:
         message = message.strip()
@@ -85,6 +89,21 @@ class ContinuousMessagePlugin(Star):
         for prefix in self.command_prefixes:
             if message.startswith(prefix): return True
         return False
+
+    def _is_typing_event(self, event: AstrMessageEvent) -> bool:
+        """检测是否为输入状态通知事件（NapCat input_status）"""
+        if not IS_AIOCQHTTP:
+            return False
+        try:
+            raw = getattr(event.message_obj, 'raw_message', None)
+            if raw is None:
+                return False
+            return (
+                raw.get('post_type') == 'notice'
+                and raw.get('sub_type') == 'input_status'
+            )
+        except Exception:
+            return False
 
     def _parse_message(self, message_obj) -> Tuple[str, bool, List[str]]:
         """
@@ -174,6 +193,28 @@ class ContinuousMessagePlugin(Star):
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=50)
     async def handle_private_msg(self, event: AstrMessageEvent):
         if not self.enable_plugin or self.debounce_time <= 0: return
+
+        # 0a. 输入状态检测：如果用户正在输入，延长防抖等待时间
+        if self.enable_typing_detection and self._is_typing_event(event):
+            raw = event.message_obj.raw_message
+            status_text = raw.get('status_text', '')
+            event_type = raw.get('event_type', '')
+            user_id = raw.get('user_id', '')
+            uid = event.unified_msg_origin
+            has_session = uid in self.sessions
+            logger.info(f"[消息防抖动] 收到输入状态通知 | user_id: {user_id} | status_text: {status_text} | event_type: {event_type} | 有活跃会话: {has_session}")
+            if has_session:
+                session = self.sessions[uid]
+                # 取消当前计时器，用更长的等待时间重新创建
+                if session.get('timer_task'):
+                    session['timer_task'].cancel()
+                session['timer_task'] = asyncio.create_task(
+                    self._timer_coroutine(uid, self.typing_extra_wait)
+                )
+                logger.info(f"[消息防抖动] 延长防抖等待 {self.typing_extra_wait}s - 用户: {uid}")
+            # 无论是否有活跃会话，都阻止输入状态事件继续传播
+            event.stop_event()
+            return
 
         # 0. 检测并处理合并转发消息（仅aiocqhttp平台）
         forward_text = ""
