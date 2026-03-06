@@ -46,5 +46,12 @@
     "type": "string",
     "default": "[系统提示：以上引用的消息是你(助手)之前发送的内容，不是用户说的话]",
     "hint": "当用户引用Bot自己发送的消息时，附加的系统提示词，用于提醒LLM这是它自己说的话"
+  },
+  "enable_typing_detection": {
+    "description": "启用输入状态感知",
+    "type": "bool",
+    "default": true,
+    "hint": "检测到用户正在输入时自动延长防抖等待时间，避免用户还在打字就触发结算（仅NapCat等支持input_status的平台有效）",
+    "obvious_hint": true
   }
 }
