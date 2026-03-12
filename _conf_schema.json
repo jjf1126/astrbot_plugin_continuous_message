@@ -53,5 +53,11 @@
     "default": true,
     "hint": "检测到用户正在输入时自动延长防抖等待时间，避免用户还在打字就触发结算（仅NapCat等支持input_status的平台有效）",
     "obvious_hint": true
+  },
+  "max_typing_wait": {
+    "description": "输入状态超时保护（秒）",
+    "type": "float",
+    "default": 60,
+    "hint": "用户正在输入时的最大等待时间。超过此时间未收到新的输入状态通知将自动恢复结算，防止平台未发送停止输入事件或因为网络原因导致卡死。建议设置根据个人使用习惯来调整。"
   }
 }

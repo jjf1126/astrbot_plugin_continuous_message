@@ -15,11 +15,11 @@ if IS_AIOCQHTTP:
     "continuous_message",
     "aliveriver",
     "将用户短时间内发送的多条私聊消息合并成一条发送给LLM（仅私聊模式，支持合并转发消息、引用消息、输入状态感知）",
-    "2.2.0"
+    "2.2.1"
 )
 class ContinuousMessagePlugin(Star):
     """
-    消息防抖动插件 v2.2.0
+    消息防抖动插件 v2.2.1
     消息防抖动插件（仅私聊模式）
     
     功能：
@@ -47,6 +47,7 @@ class ContinuousMessagePlugin(Star):
         self.enable_forward_analysis = self.config.get('enable_forward_analysis', True)
         self.forward_prefix = self.config.get('forward_prefix', '【合并转发内容】\n')
         self.enable_typing_detection = self.config.get('enable_typing_detection', True)
+        self.max_typing_wait = float(self.config.get('max_typing_wait', 5.0))
 
         # 引用消息配置
         reply_format = '[引用消息({sender_name}: {full_text})]'
@@ -73,7 +74,7 @@ class ContinuousMessagePlugin(Star):
         self.parser = MessageParser(image_component=image_comp, plain_component=plain_comp)
         self.forward_handler = ForwardHandler(reply_format=reply_format, bot_reply_hint=bot_reply_hint)
 
-        logger.info(f"[消息防抖动] v2.2.0 加载 | 事件驱动模式 | 防抖: {self.debounce_time}s | 合并消息: {self.enable_forward_analysis} | 输入感知: {self.enable_typing_detection}")
+        logger.info(f"[消息防抖动] v2.2.1 加载 | 事件驱动模式 | 防抖: {self.debounce_time}s | 合并消息: {self.enable_forward_analysis} | 输入感知: {self.enable_typing_detection}")
 
     async def _timer_coroutine(self, uid: str, duration: float):
         """
@@ -98,29 +99,36 @@ class ContinuousMessagePlugin(Star):
         if self.enable_typing_detection and self.parser.is_typing_event(event):
             raw = event.message_obj.raw_message
             status_text = raw.get('status_text', '')
+            event_type = raw.get('event_type', '')
             user_id = raw.get('user_id', '')
             uid = event.unified_msg_origin
             has_session = uid in self.sessions
             is_typing = '正在输入' in status_text
-            logger.debug(f"[消息防抖动] 输入状态通知 | user_id: {user_id} | status_text: {status_text} | is_typing: {is_typing} | 有活跃会话: {has_session}")
+            logger.debug(f"[消息防抖动] 输入状态通知 | user_id: {user_id} | status_text: {status_text} | is_typing: {is_typing} | 有活跃会话: {has_session} | event_type: {event_type}")
             if has_session:
                 session = self.sessions[uid]
                 if is_typing:
-                    # 正在输入：取消计时器，暂停结算
+                    # 正在输入：取消原计时器，启动超时保护计时器防止卡死
                     session['is_typing'] = True
                     if session.get('timer_task'):
                         session['timer_task'].cancel()
-                        session['timer_task'] = None
-                    logger.info(f"[消息防抖动] 用户正在输入，暂停结算 - 用户: {uid}")
-                else:
-                    # 停止输入：恢复正常防抖倒计时
-                    session['is_typing'] = False
-                    if session.get('timer_task'):
-                        session['timer_task'].cancel()
                     session['timer_task'] = asyncio.create_task(
-                        self._timer_coroutine(uid, self.debounce_time)
+                        self._timer_coroutine(uid, self.max_typing_wait)
                     )
-                    logger.info(f"[消息防抖动] 用户停止输入，恢复防抖 {self.debounce_time}s - 用户: {uid}")
+                    logger.info(f"[消息防抖动] 用户正在输入，暂停结算（超时保护 {self.max_typing_wait}s） - 用户: {uid}")
+                else:
+                    # 停止输入：仅在之前确实处于输入状态时才恢复防抖倒计时
+                    # 避免重复的 is_typing=False 通知反复重置计时器
+                    if session.get('is_typing'):
+                        session['is_typing'] = False
+                        if session.get('timer_task'):
+                            session['timer_task'].cancel()
+                        session['timer_task'] = asyncio.create_task(
+                            self._timer_coroutine(uid, self.debounce_time)
+                        )
+                        logger.info(f"[消息防抖动] 用户停止输入，恢复防抖 {self.debounce_time}s - 用户: {uid}")
+                    else:
+                        logger.debug(f"[消息防抖动] 忽略重复的停止输入通知 - 用户: {uid}")
             event.stop_event()
             return
 
