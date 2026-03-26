@@ -52,35 +52,68 @@ class MessageParser:
             return f"https://{url}"
         return ""
 
+    def _rule_xiaoheihe_bbs_share(self, host: str, path: str, query: dict) -> str:
+        if host == "api.xiaoheihe.cn" and path == "/v3/bbs/app/api/web/share":
+            link_id = (query.get("link_id") or [""])[0].strip()
+            if link_id:
+                return f"https://www.xiaoheihe.cn/app/bbs/link/{link_id}"
+        return ""
+
+    def _rule_xiaoheihe_game_share(self, host: str, path: str, query: dict) -> str:
+        if host == "api.xiaoheihe.cn" and path == "/game/share_game_detail":
+            appid = (query.get("appid") or [""])[0].strip()
+            game_type = (query.get("game_type") or ["pc"])[0].strip().lower() or "pc"
+            if appid:
+                return f"https://www.xiaoheihe.cn/app/topic/game/{game_type}/{appid}"
+        return ""
+
+    def _rule_tieba_post_share(self, host: str, path: str, query: dict) -> str:
+        if host in {"tieba.baidu.com", "www.tieba.baidu.com"}:
+            matched = re.match(r"^/p/(\d+)", path)
+            if matched:
+                return f"https://tieba.baidu.com/p/{matched.group(1)}"
+        return ""
+
+    def _rule_ncm_song_share(self, host: str, path: str, query: dict) -> str:
+        if host == "y.music.163.com" and path == "/m/song":
+            song_id = (query.get("id") or [""])[0].strip()
+            if song_id.isdigit():
+                return f"https://music.163.com/#/song?id={song_id}"
+        return ""
+
+    def _is_wrapper_share_url(self, url: str) -> bool:
+        """识别QQ卡片常见中转壳链接，避免优先输出不可解析链接。"""
+        try:
+            parsed = urlparse(url)
+            host = (parsed.netloc or "").lower()
+            path = parsed.path or ""
+            return host in {"m.q.qq.com", "q.qq.com"} and path.startswith("/a/s/")
+        except Exception:
+            return False
+
+    def _apply_share_url_rules(self, host: str, path: str, query: dict, fallback_url: str) -> str:
+        rules = (
+            self._rule_xiaoheihe_bbs_share,
+            self._rule_xiaoheihe_game_share,
+            self._rule_tieba_post_share,
+            self._rule_ncm_song_share,
+        )
+        for rule in rules:
+            result = rule(host, path, query)
+            if result:
+                return result
+        return fallback_url
+
     def _canonicalize_known_share_url(self, url: str) -> str:
-        """将部分平台的API分享链接规范化为可直开的网页链接。"""
+        """统一入口：将卡片分享链接规范化为更稳定、可打开的网页链接。"""
         try:
             parsed = urlparse(url)
             host = (parsed.netloc or "").lower()
             path = parsed.path or ""
             query = parse_qs(parsed.query)
-
-            # 小黑盒帖子分享 API -> 网页链接
-            if host == "api.xiaoheihe.cn" and path == "/v3/bbs/app/api/web/share":
-                link_id = (query.get("link_id") or [""])[0].strip()
-                if link_id:
-                    return f"https://www.xiaoheihe.cn/app/bbs/link/{link_id}"
-
-            # 小黑盒游戏分享 API -> 网页链接
-            if host == "api.xiaoheihe.cn" and path == "/game/share_game_detail":
-                appid = (query.get("appid") or [""])[0].strip()
-                game_type = (query.get("game_type") or ["pc"])[0].strip().lower() or "pc"
-                if appid:
-                    return f"https://www.xiaoheihe.cn/app/topic/game/{game_type}/{appid}"
-
-            # 百度贴吧分享链接 -> 帖子主链接（去除分享追踪参数）
-            if host in {"tieba.baidu.com", "www.tieba.baidu.com"}:
-                matched = re.match(r"^/p/(\d+)", path)
-                if matched:
-                    return f"https://tieba.baidu.com/p/{matched.group(1)}"
+            return self._apply_share_url_rules(host, path, query, url)
         except Exception:
             return url
-        return url
 
     def _extract_urls_from_json_payload(self, payload) -> List[str]:
         payload = self._safe_json_loads(payload)
@@ -111,7 +144,9 @@ class MessageParser:
             if u not in seen:
                 seen.add(u)
                 deduped.append(u)
-        return deduped
+
+        non_wrappers = [u for u in deduped if not self._is_wrapper_share_url(u)]
+        return non_wrappers or deduped
 
     def is_command(self, message: str, prefixes: list) -> bool:
         """检查消息是否为指令"""
