@@ -25,17 +25,53 @@ class MessageParser:
     _URL_KEY_HINTS = {"jumpurl", "qqdocurl", "url", "musicurl"}
     _SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://")
     _HOST_PATH_PATTERN = re.compile(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/.*)?$")
+    _CARD_PLATFORM_LABELS = {
+        "bilibili": "B站",
+        "nga": "NGA",
+        "ncm": "网易云音乐",
+        "tieba": "百度贴吧",
+        "xhs": "小红书",
+        "xiaoheihe": "小黑盒",
+        "zhihu": "知乎",
+    }
     
-    def __init__(self, image_component=None, plain_component=None):
+    def __init__(self, image_component=None, plain_component=None, plugin_config=None):
         self._ImageComponent = image_component
         self._PlainComponent = plain_component
+        config = plugin_config or {}
+        self.enable_qq_card_parsing = bool(config.get("enable_qq_card_parsing", True))
+        self.qq_card_prompt = str(config.get("qq_card_prompt", "[卡片链接]")).strip()
+        self.qq_card_disabled_platforms = self._normalize_platform_set(
+            config.get("qq_card_disabled_platforms", [])
+        )
 
-    def _safe_json_loads(self, value):
+    @staticmethod
+    def _normalize_platform_set(value) -> set[str]:
+        if isinstance(value, str):
+            items = [item.strip() for item in value.split(",")]
+        elif isinstance(value, list):
+            items = [str(item).strip() for item in value]
+        else:
+            items = []
+        return {item.lower() for item in items if item}
+
+    @staticmethod
+    def _append_prompt_line(prompt: str, url: str) -> str:
+        clean_prompt = (prompt or "").strip()
+        return f"{clean_prompt} {url}".strip() if clean_prompt else url
+
+    def _safe_json_loads(self, value, source: str = "qq_card"):
         if not isinstance(value, str):
             return value
         try:
             return json.loads(value)
-        except Exception:
+        except Exception as exc:
+            stripped = value.lstrip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                snippet = " ".join(stripped.split())[:160]
+                logger.warning(
+                    f"[消息防抖动] QQ 卡片内容反序列化失败 | source={source} | error={exc} | payload={snippet}"
+                )
             return value
 
     def _normalize_url(self, value: str) -> str:
@@ -74,6 +110,46 @@ class MessageParser:
                 return f"https://tieba.baidu.com/p/{matched.group(1)}"
         return ""
 
+    def _rule_bilibili_share(self, host: str, path: str, query: dict) -> str:
+        if host in {"www.bilibili.com", "bilibili.com", "m.bilibili.com"}:
+            matched = re.match(r"^/(?:video/)?(?P<video_id>BV[0-9A-Za-z]{10}|av\d+)", path)
+            if matched:
+                page_num = (query.get("p") or [""])[0].strip()
+                canonical = f"https://www.bilibili.com/video/{matched.group('video_id')}"
+                if page_num.isdigit() and int(page_num) > 1:
+                    canonical += f"?p={page_num}"
+                return canonical
+        return ""
+
+    def _rule_xhs_share(self, host: str, path: str, query: dict, original_url: str) -> str:
+        if host not in {"www.xiaohongshu.com", "xiaohongshu.com"}:
+            return ""
+        matched = re.match(r"^/(?:discovery/item|explore)/(?P<note_id>[0-9A-Za-z]+)", path)
+        if not matched:
+            return ""
+        note_id = matched.group("note_id")
+        if not note_id:
+            return ""
+
+        query_items = []
+        for key, values in query.items():
+            for value in values:
+                query_items.append(f"{key}={value}")
+        query_text = "&".join(query_items)
+        if query_text:
+            return f"https://www.xiaohongshu.com/discovery/item/{note_id}?{query_text}"
+        return original_url
+
+    def _rule_nga_share(self, host: str, path: str, query: dict) -> str:
+        if host not in {"ngabbs.com", "nga.178.com", "bbs.nga.cn"}:
+            return ""
+        if path != "/read.php":
+            return ""
+        tid = (query.get("tid") or [""])[0].strip()
+        if tid.isdigit():
+            return f"https://ngabbs.com/read.php?tid={tid}"
+        return ""
+
     def _rule_ncm_song_share(self, host: str, path: str, query: dict) -> str:
         if host == "y.music.163.com" and path == "/m/song":
             song_id = (query.get("id") or [""])[0].strip()
@@ -108,16 +184,85 @@ class MessageParser:
         except Exception:
             return False
 
+    def _identify_card_platform(self, url: str) -> str:
+        try:
+            parsed = urlparse(url)
+            host = (parsed.netloc or "").lower()
+            path = parsed.path or ""
+        except Exception:
+            return ""
+
+        if host in {"www.bilibili.com", "bilibili.com", "m.bilibili.com", "b23.tv", "bili2233.cn"}:
+            return "bilibili"
+        if host in {"www.xiaohongshu.com", "xiaohongshu.com", "xhslink.com"}:
+            return "xhs"
+        if host in {"api.xiaoheihe.cn", "www.xiaoheihe.cn", "xiaoheihe.cn"}:
+            return "xiaoheihe"
+        if host in {"tieba.baidu.com", "www.tieba.baidu.com"} and re.match(r"^/p/\d+", path):
+            return "tieba"
+        if host in {"ngabbs.com", "nga.178.com", "bbs.nga.cn"}:
+            return "nga"
+        if host in {"y.music.163.com", "music.163.com", "163cn.tv"}:
+            return "ncm"
+        if host in {"www.zhihu.com", "zhihu.com", "zhuanlan.zhihu.com"}:
+            return "zhihu"
+        return ""
+
+    def _needs_card_canonicalization(self, url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            host = (parsed.netloc or "").lower()
+            path = parsed.path or ""
+        except Exception:
+            return False
+
+        if host in {"m.q.qq.com", "q.qq.com"} and path.startswith("/a/s/"):
+            return True
+        if host == "api.xiaoheihe.cn" and path in {"/v3/bbs/app/api/web/share", "/game/share_game_detail"}:
+            return True
+        if host in {"b23.tv", "bili2233.cn", "163cn.tv", "xhslink.com"}:
+            return True
+        if host == "y.music.163.com" and path == "/m/song":
+            return True
+        return False
+
+    def _process_card_url(self, normalized_url: str) -> str:
+        canonical = self._canonicalize_known_share_url(normalized_url)
+        platform = self._identify_card_platform(canonical) or self._identify_card_platform(normalized_url)
+
+        if not platform:
+            logger.debug(f"[消息防抖动] 提取到 URL 但无法识别平台: {normalized_url}")
+        elif canonical == normalized_url and self._needs_card_canonicalization(normalized_url):
+            logger.debug(f"[消息防抖动] QQ 卡片链接规范化失败，保留原始链接: {normalized_url}")
+
+        return self._filter_card_url(normalized_url, canonical)
+
+    def _filter_card_url(self, original_url: str, canonical_url: str) -> str:
+        platform = self._identify_card_platform(canonical_url) or self._identify_card_platform(original_url)
+        if platform and platform in self.qq_card_disabled_platforms:
+            display_name = self._CARD_PLATFORM_LABELS.get(platform, platform)
+            logger.debug(
+                f"[消息防抖动] 跳过已屏蔽的 QQ 卡片平台: {display_name} ({canonical_url or original_url})"
+            )
+            return ""
+        return canonical_url or original_url
+
     def _apply_share_url_rules(self, host: str, path: str, query: dict, fallback_url: str) -> str:
         rules = (
             self._rule_xiaoheihe_bbs_share,
             self._rule_xiaoheihe_game_share,
             self._rule_tieba_post_share,
+            self._rule_bilibili_share,
+            self._rule_xhs_share,
+            self._rule_nga_share,
             self._rule_ncm_song_share,
             self._rule_zhihu_share,
         )
         for rule in rules:
-            result = rule(host, path, query)
+            if getattr(rule, "__name__", "") == "_rule_xhs_share":
+                result = rule(host, path, query, fallback_url)
+            else:
+                result = rule(host, path, query)
             if result:
                 return result
         return fallback_url
@@ -134,9 +279,9 @@ class MessageParser:
             return url
 
     def _extract_urls_from_json_payload(self, payload) -> List[str]:
-        payload = self._safe_json_loads(payload)
+        payload = self._safe_json_loads(payload, source="qq_card_root")
         if isinstance(payload, dict) and "data" in payload:
-            payload["data"] = self._safe_json_loads(payload.get("data"))
+            payload["data"] = self._safe_json_loads(payload.get("data"), source="qq_card_data")
 
         extracted: List[str] = []
 
@@ -147,7 +292,9 @@ class MessageParser:
                     if key_lower in self._URL_KEY_HINTS and isinstance(val, str):
                         normalized = self._normalize_url(val)
                         if normalized:
-                            extracted.append(self._canonicalize_known_share_url(normalized))
+                            filtered = self._process_card_url(normalized)
+                            if filtered:
+                                extracted.append(filtered)
                     walk(val)
             elif isinstance(node, list):
                 for item in node:
@@ -224,7 +371,10 @@ class MessageParser:
                 elif isinstance(component, dict) and component.get('type') == 'json':
                     json_payload = component.get('data')
                 if json_payload is not None:
-                    card_urls.extend(self._extract_urls_from_json_payload(json_payload))
+                    try:
+                        card_urls.extend(self._extract_urls_from_json_payload(json_payload))
+                    except Exception as exc:
+                        logger.error(f"[消息防抖动] QQ 卡片解析异常: {exc}")
                 
                 # 识别图片组件（优先使用 isinstance，后备使用类名检查）
                 is_img = False
@@ -240,10 +390,10 @@ class MessageParser:
                         image_urls.append(component.url)
                     elif hasattr(component, 'file') and component.file:
                         image_urls.append(component.file)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error(f"[消息防抖动] 消息解析异常: {exc}")
 
-        if card_urls:
+        if self.enable_qq_card_parsing and card_urls:
             # 去重并添加标识，便于LLM在整合消息中识别原始来源链接
             deduped_links = []
             seen = set()
@@ -251,7 +401,9 @@ class MessageParser:
                 if u not in seen:
                     seen.add(u)
                     deduped_links.append(u)
-            card_text = "\n".join(f"[卡片链接] {u}" for u in deduped_links)
+            card_text = "\n".join(
+                self._append_prompt_line(self.qq_card_prompt, u) for u in deduped_links
+            )
             text = (f"{text}\n{card_text}" if text else card_text)
 
         return text, has_image, image_urls
