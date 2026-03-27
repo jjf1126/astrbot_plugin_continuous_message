@@ -81,6 +81,23 @@ class MessageParser:
                 return f"https://music.163.com/#/song?id={song_id}"
         return ""
 
+    def _rule_zhihu_share(self, host: str, path: str, query: dict) -> str:
+        if host == "zhuanlan.zhihu.com":
+            article_matched = re.match(r"^/p/(\d+)", path)
+            if article_matched:
+                return f"https://zhuanlan.zhihu.com/p/{article_matched.group(1)}"
+
+        if host in {"www.zhihu.com", "zhihu.com"}:
+            answer_matched = re.match(r"^/question/(\d+)/answer/(\d+)", path)
+            if answer_matched:
+                qid, aid = answer_matched.groups()
+                return f"https://www.zhihu.com/question/{qid}/answer/{aid}"
+
+            question_matched = re.match(r"^/question/(\d+)", path)
+            if question_matched:
+                return f"https://www.zhihu.com/question/{question_matched.group(1)}"
+        return ""
+
     def _is_wrapper_share_url(self, url: str) -> bool:
         """识别QQ卡片常见中转壳链接，避免优先输出不可解析链接。"""
         try:
@@ -97,6 +114,7 @@ class MessageParser:
             self._rule_xiaoheihe_game_share,
             self._rule_tieba_post_share,
             self._rule_ncm_song_share,
+            self._rule_zhihu_share,
         )
         for rule in rules:
             result = rule(host, path, query)
