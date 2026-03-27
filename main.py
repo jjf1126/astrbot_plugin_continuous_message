@@ -240,14 +240,19 @@ class ContinuousMessagePlugin(Star):
         
         buffer = session_data['buffer']
         all_images = session_data['images']
+        original_image_count = len(all_images)
         merged_text = self.merge_separator.join(buffer).strip()
         merged_text, all_images = await self.link_parser.enrich(merged_text, all_images)
+        parsed_added_image_count = max(len(all_images) - original_image_count, 0)
         
         if not merged_text and not all_images:
             return
 
         img_info = f" + {len(all_images)}图" if all_images else ""
         logger.info(f"[消息防抖动] 结算触发 - 共 {len(buffer)} 条{img_info} -> 发送")
+        logger.info(
+            f"[消息防抖动] 图片统计 | 原图数量: {original_image_count} | 解析追加图数量: {parsed_added_image_count}"
+        )
         logger.info(f"[消息防抖动] 合并后的完整消息:\n{merged_text}")
         if all_images:
             logger.debug(f"[消息防抖动] 图片列表: {all_images}")
