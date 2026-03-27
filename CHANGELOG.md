@@ -1,5 +1,67 @@
 # 更新日志
 
+## v2.3.0
+
+### 新增功能
+- ✨ **QQ 卡片链接提取与链接增强解析**
+  - 支持从 QQ `json` 卡片中提取原始链接，并写入合并消息
+  - 支持在消息结算阶段对部分平台链接补充平台、标题、正文、图片、封面、作者等信息
+  - 当前支持 QQ 卡片解析的平台：
+    - B站
+    - 小红书
+    - 小黑盒
+    - 百度贴吧
+    - NGA
+    - 网易云音乐
+    - 知乎
+  - 当前支持链接内容解析的平台：
+    - B站
+    - 小红书
+    - 小黑盒
+    - 网易云音乐
+
+### 配置项新增
+- `enable_qq_card_parsing` (bool, 默认: true)
+  - 控制是否启用 QQ 卡片链接提取
+- `qq_card_disabled_platforms` (list, 默认: [])
+  - 用于屏蔽指定平台的 QQ 卡片解析
+- `qq_card_prompt` (string, 默认: "[卡片链接]")
+  - 控制写入合并消息时的 QQ 卡片链接引导词
+- `enable_link_parsing` (bool, 默认: true)
+  - 控制是否启用链接增强解析
+- `link_parser_disabled_platforms` (list, 默认: [])
+  - 用于屏蔽指定平台的链接内容解析
+- `link_parser_success_prompt` (string, 默认: "[链接解析]")
+  - 控制链接解析成功后的分节引导词
+- `link_parser_failure_prompt` (string, 默认: "[链接解析失败]")
+  - 控制链接解析失败后的分节引导词
+- `link_parser_max_links` (int, 默认: 3)
+  - 控制单次结算中最多解析的链接数量
+- `link_parser_timeout` (float, 默认: 12.0)
+  - 控制单个链接解析请求的总超时时间
+- `link_parser_merge_images` (bool, 默认: true)
+  - 控制是否将链接解析得到的图片或封面并入最终图片流
+- `link_parser_max_text_length` (int, 默认: 600)
+  - 控制链接解析正文的最大保留长度
+- `link_parser_proxy` (string, 默认: "")
+  - 为链接解析提供可选代理地址
+
+### 日志增强
+- 🔍 **补充 QQ 卡片解析可观测性**
+  - 反序列化失败时记录 `warning`
+  - 卡片解析异常时记录 `error`
+  - 提取到 URL 但无法识别平台时记录 `debug`
+  - 链接规范化失败并回退原始链接时记录 `debug`
+- 🔍 **补充链接解析结果日志**
+  - 链接解析初始化失败、匹配结果、单条链接解析失败、追加结果数量均会记录日志
+
+### 文档更新
+- 更新 `README.md`
+  - 补充 QQ 卡片解析与链接解析的新增配置项说明
+  - 补充平台内部名、默认值、用途和示例
+
+---
+
 ## v2.2.1 (2026-03-12)
 
 ### Bug修复
