@@ -6,6 +6,7 @@ from astrbot.api import AstrBotConfig, logger
 
 from .message_parser import MessageParser, IS_AIOCQHTTP
 from .forward_handler import ForwardHandler
+from .link_parser_adapter import LinkParserAdapter
 
 # 检查是否为 aiocqhttp 平台
 if IS_AIOCQHTTP:
@@ -15,11 +16,11 @@ if IS_AIOCQHTTP:
     "continuous_message",
     "aliveriver",
     "将用户短时间内发送的多条私聊消息合并成一条发送给LLM（仅私聊模式，支持合并转发消息、引用消息、输入状态感知）",
-    "2.2.1"
+    "2.3.0"
 )
 class ContinuousMessagePlugin(Star):
     """
-    消息防抖动插件 v2.2.1
+    消息防抖动插件 v2.3.0
     消息防抖动插件（仅私聊模式）
     
     功能：
@@ -47,7 +48,7 @@ class ContinuousMessagePlugin(Star):
         self.enable_forward_analysis = self.config.get('enable_forward_analysis', True)
         self.forward_prefix = self.config.get('forward_prefix', '【合并转发内容】\n')
         self.enable_typing_detection = self.config.get('enable_typing_detection', True)
-        self.max_typing_wait = float(self.config.get('max_typing_wait', 5.0))
+        self.max_typing_wait = float(self.config.get('max_typing_wait', 60.0))
 
         # 引用消息配置
         reply_format = '[引用消息({sender_name}: {full_text})]'
@@ -71,10 +72,22 @@ class ContinuousMessagePlugin(Star):
             except ImportError:
                 logger.error("[消息防抖动] 严重: 组件导入失败")
 
-        self.parser = MessageParser(image_component=image_comp, plain_component=plain_comp)
+        self.parser = MessageParser(
+            image_component=image_comp,
+            plain_component=plain_comp,
+            plugin_config=self.config,
+        )
         self.forward_handler = ForwardHandler(reply_format=reply_format, bot_reply_hint=bot_reply_hint)
+        self.link_parser = LinkParserAdapter(self.config)
 
-        logger.info(f"[消息防抖动] v2.2.1 加载 | 事件驱动模式 | 防抖: {self.debounce_time}s | 合并消息: {self.enable_forward_analysis} | 输入感知: {self.enable_typing_detection}")
+        logger.info(
+            f"[消息防抖动] v2.3.0 加载 | 事件驱动模式 | 防抖: {self.debounce_time}s "
+            f"| 合并消息: {self.enable_forward_analysis} | 输入感知: {self.enable_typing_detection} "
+            f"| QQ卡片解析: {self.parser.enable_qq_card_parsing} | 链接解析: {self.link_parser.enabled}"
+        )
+
+    async def terminate(self):
+        await self.link_parser.close()
 
     async def _timer_coroutine(self, uid: str, duration: float):
         """
@@ -227,13 +240,19 @@ class ContinuousMessagePlugin(Star):
         
         buffer = session_data['buffer']
         all_images = session_data['images']
+        original_image_count = len(all_images)
         merged_text = self.merge_separator.join(buffer).strip()
+        merged_text, all_images = await self.link_parser.enrich(merged_text, all_images)
+        parsed_added_image_count = max(len(all_images) - original_image_count, 0)
         
         if not merged_text and not all_images:
             return
 
         img_info = f" + {len(all_images)}图" if all_images else ""
         logger.info(f"[消息防抖动] 结算触发 - 共 {len(buffer)} 条{img_info} -> 发送")
+        logger.info(
+            f"[消息防抖动] 图片统计 | 原图数量: {original_image_count} | 解析追加图数量: {parsed_added_image_count}"
+        )
         logger.info(f"[消息防抖动] 合并后的完整消息:\n{merged_text}")
         if all_images:
             logger.debug(f"[消息防抖动] 图片列表: {all_images}")
