@@ -19,7 +19,6 @@ class LofterLiteParser(BaseLiteParser):
             "Referer": "https://www.lofter.com/"
         })
         
-        # 尝试读取 Cookie 文件
         cookie_dir = self.ensure_cookie_dir(self.config.get("cookie_dir", "data/cookies"))
         cookie_file = cookie_dir / "lofter_cookies.txt"
         if cookie_file.exists():
@@ -35,38 +34,32 @@ class LofterLiteParser(BaseLiteParser):
         post_id = searched.group("post_id")
         url = f"https://{username}.lofter.com/post/{post_id}"
 
-        # 使用 curl_cffi 发送请求，模仿真实浏览器
         async with curl_requests.AsyncSession(impersonate="chrome110") as session:
             response = await session.get(url, headers=self.headers)
             html_text = response.text
 
         soup = BeautifulSoup(html_text, "html.parser")
         
-        # 解析正文（LOFTER 常见的正文 class 为 content）
         content_div = soup.find("div", class_="content") or soup.find("div", class_="text")
+        # 移除 [:500] 限制，交由 adapter 统一处理
         text = content_div.get_text(separator="\n").strip() if content_div else ""
         
-        # 解析标题
-        title = ""
         title_tag = soup.find("h2") or soup.find("title")
-        if title_tag:
-            title = title_tag.get_text().strip()
+        title = title_tag.get_text().strip() if title_tag else ""
 
-        # 解析图片
         image_urls = []
-        # LOFTER 图片通常在 img 标签的 bigimgsrc 属性中
         for img in soup.find_all("img"):
             src = img.get("bigimgsrc") or img.get("src")
             if src and "nosdn.127.net" in src:
-                image_urls.append(src.split("?")[0]) # 去掉缩略图参数
+                image_urls.append(src.split("?")[0])
 
         if not text and not image_urls:
-            raise ParseException("无法解析 LOFTER 内容，可能由于私密设置或反爬虫拦截")
+            raise ParseException("无法解析 LOFTER 内容")
 
         return self.result(
             title=title or f"LOFTER 笔记 - {username}",
-            text=text[:10000], # 长度截断
+            text=text, 
             author=self.create_author(name=username),
-            contents=self.create_image_contents(image_urls[:9]), # 最多取9张
+            contents=self.create_image_contents(image_urls[:9]),
             url=url,
         )
